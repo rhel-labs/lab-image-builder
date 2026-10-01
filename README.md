@@ -288,6 +288,14 @@ one run: `-e provision=provision/rhsm.yml,provision/lab-users.yml` — an
 explicit list replaces the convention entirely, and a path in it that does
 not exist is an error rather than a silent skip.
 
+`provision/default.yml` ships with one job: stopping GCP taking the hostname
+back. Three separate things reset it — cloud-init's `cc_update_hostname` on
+every boot, NetworkManager accepting the name DHCP offers, and a Google
+NetworkManager dispatcher hook that truncates an FQDN to its short form on
+every interface-up. They fire at different moments, so fixing one and
+missing another reads as an intermittent bug. Pass `-e lab_hostname=x.y.z`
+to pin a name; with no argument it freezes whatever the VM already has.
+
 **These are ordinary standalone playbooks.** Nothing in them knows about this
 repo, and `import-image.yml` shells out to `ansible-playbook` rather than
 importing them, so the same file runs by hand against a real lab VM with any
@@ -508,7 +516,7 @@ blueprints/
   .remote-state.json              slug -> id + version (committed)
 provision/
   example.yml                     template; not picked up automatically
-  default.yml                     if present, runs against every image
+  default.yml                     runs against every image — hostname pinning
   <blueprint-slug>.yml            if present, that blueprint only
 tests/
   default.yml                     checks every image must pass

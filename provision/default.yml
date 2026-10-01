@@ -1,0 +1,99 @@
+---
+# Stop GCP taking the hostname back.
+#
+# Three independent things reset the hostname on a RHEL GCP instance. They
+# fire at different moments, so fixing one and missing another reads as an
+# intermittent bug — the name sticks until the next reboot, or until
+# NetworkManager happens to restart, and then it doesn't.
+#
+# Standalone, like everything in provision/. Nothing here knows about this
+# repo, so the same file runs by hand against a real lab VM:
+#
+#   ansible-playbook -i lab-hosts provision/default.yml
+#   ansible-playbook -i lab-hosts provision/default.yml -e lab_hostname=student1.lab
+- name: Keep GCP from managing the hostname
+  hosts: all
+  become: true
+
+  vars:
+    # Empty freezes whatever the VM is called right now. Set it to pin a
+    # specific name instead.
+    lab_hostname: ""
+
+  handlers:
+    - name: Reload NetworkManager
+      ansible.builtin.systemd_service:
+        name: NetworkManager
+        state: reloaded
+
+  tasks:
+    # 1. cloud-init. cc_update_hostname runs on *every* boot, not just the
+    #    first, and resets the hostname to the metadata server's
+    #    local-hostname.
+    - name: Tell cloud-init to preserve the hostname
+      ansible.builtin.copy:
+        dest: /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
+        content: |
+          # Managed by lab-image-builder.
+          preserve_hostname: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    # 2. NetworkManager. hostname-mode defaults to accepting whatever DHCP
+    #    offers, and GCP's DHCP offers the instance name.
+    - name: Tell NetworkManager not to touch the hostname
+      ansible.builtin.copy:
+        dest: /etc/NetworkManager/conf.d/99-no-hostname.conf
+        content: |
+          # Managed by lab-image-builder.
+          [main]
+          hostname-mode=none
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload NetworkManager
+
+    # 3. Google's NetworkManager dispatcher hook, which is the one that is
+    #    easy to miss. It runs on every interface-up and truncates an FQDN
+    #    to its short form, so `hostnamectl set-hostname a.b.c` looks like it
+    #    worked and later becomes plain `a`. The filename has moved between
+    #    guest-configs releases, so find it rather than assume a path.
+    - name: Find Google's hostname dispatcher hooks
+      ansible.builtin.find:
+        paths: /etc/NetworkManager/dispatcher.d
+        patterns: "*google*hostname*"
+        file_type: any
+        recurse: true
+      register: lab_google_hooks
+
+    - name: Disable Google's hostname dispatcher hooks
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        mode: "0644"
+      loop: "{{ lab_google_hooks.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # Last, so nothing above can revert it between tasks.
+    #
+    # Note that `hostnamectl` writes /etc/hostname and does not touch
+    # /etc/hosts — and disabling the Google hook above is what used to
+    # maintain /etc/hosts. If something on the VM needs its own FQDN to
+    # resolve locally, add the entry yourself.
+    - name: Pin the hostname
+      ansible.builtin.hostname:
+        name: "{{ lab_hostname }}"
+      when: lab_hostname | length > 0
+
+    - name: Show what the hostname settled on
+      ansible.builtin.command: hostnamectl --static
+      register: lab_hostname_now
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          Static hostname is {{ lab_hostname_now.stdout | trim }};
+          {{ lab_google_hooks.files | length }} Google dispatcher hook(s)
+          disabled.
