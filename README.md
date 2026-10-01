@@ -1,4 +1,4 @@
-# lab-images
+# lab-image-builder
 
 RHEL VM images for GCP labs, composed by Red Hat's hosted Image Builder at
 console.redhat.com from blueprints kept in this repo.
@@ -23,34 +23,27 @@ is a separate job with separate credentials, so it is a separate playbook.
 
 1. **Ansible** — `brew install ansible`
 2. **A Red Hat service account** from
-   <https://console.redhat.com/iam/service-accounts>, in a User Access group
-   at <https://console.redhat.com/iam/user-access/groups> whose roles cover
-   **both**:
-   - an Image Builder role, and
-   - **`Repositories viewer`** and **`Content Template viewer`**
-     (content-sources).
+   <https://console.redhat.com/iam/service-accounts>, added to a User Access
+   group holding **`Repositories viewer`** and **`Content Template viewer`**
+   (content-sources). Those two are the whole requirement — there is no Image
+   Builder role to add, because Image Builder access comes from the org's
+   Default access group.
 
-   The second one is easy to miss and is **currently the blocker here.**
-   Creating and editing blueprints does not check RBAC, so a service account
-   with no roles at all appears to work — `pull-blueprints.yml` and the whole
-   of `build-image.yml` up to the compose succeed. Compose then fails with:
+   Privileges attach to the *group*, and the account goes on the group's
+   **Service accounts** tab, which is not the Members tab. Full write-up,
+   including why an account with no roles appears to work right up until the
+   compose: **[docs/service-account.md](docs/service-account.md)**.
 
-   ```
-   403 unable to retrieve Red Hat repositories: user is not authorized -
-   please check your 'Repositories viewer' or 'Content Template viewer'
-   permissions
-   ```
-
-   because composing resolves Red Hat repositories through content-sources.
-   Check what the account actually holds:
+   Confirm before building:
 
    ```sh
    curl -H "Authorization: Bearer $TOKEN" \
      'https://console.redhat.com/api/rbac/v1/access/?application=content-sources'
    ```
 
-   `"count": 0` means no roles. `build-image.yml` detects this 403 and prints
-   the fix rather than an HTTP dump.
+   `"count": 2` is correct. `"count": 0` means no roles, or an account that
+   was never added to the group. `build-image.yml` detects the resulting 403
+   and prints the fix rather than an HTTP dump.
 3. **Credentials on disk**, outside this repo so they cannot be committed:
 
    ```sh
@@ -169,7 +162,9 @@ Both failures name the versions involved and give you the two ways out:
   `distribution`, `customizations`, `image_requests`, `metadata`, `bootc`.
   `content_sources` and `snapshot_date` can be read but not written, so they
   are not stored locally — a field you can edit and not push is a trap.
-- **401 means the token; 403 means the User Access group.**
+- **401 means the token; 403 means the User Access group.** Which group
+  privilege is missing depends on where the 403 lands —
+  [docs/service-account.md](docs/service-account.md) has the table.
 - **Don't put `curl` in `packages`.** RHEL 9+ ships `curl-minimal`, which
   already provides the binary; asking for `curl` forces a swap that can fail
   dependency resolution at compose time. Same reasoning behind `git-core`
@@ -185,6 +180,7 @@ Both failures name the versions involved and give you the two ways out:
 ansible.cfg
 inventory.yml                     localhost, connection: local
 group_vars/all/main.yml           endpoints, delivery target, defaults
+docs/service-account.md           console-side RBAC setup
 blueprints/
   lab-base-rhel-10.2.yml          edit these
   .remote-state.json              slug -> id + version (committed)
