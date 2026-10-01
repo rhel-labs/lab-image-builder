@@ -167,8 +167,17 @@ Both failures name the versions involved and give you the two ways out:
   [docs/service-account.md](docs/service-account.md) has the table.
 - **Don't put `curl` in `packages`.** RHEL 9+ ships `curl-minimal`, which
   already provides the binary; asking for `curl` forces a swap that can fail
-  dependency resolution at compose time. Same reasoning behind `git-core`
-  over `git` and `vim-enhanced` over `vim`.
+  dependency resolution at compose time. `vim-enhanced` over `vim` is the
+  same reasoning. `git` over `git-core` is a deliberate exception — the lab
+  base wants the full tool and accepts the perl it drags in.
+- **Several RHEL 9 package names are gone in RHEL 10, and they fail
+  differently.** `mlocate` → `plocate` and `cockpit-pcp` → (folded into
+  `cockpit-system`, with `pcp` supplying the data) have no provider at all,
+  so the compose fails outright. `cockpit-composer` is worse: it is
+  `Provides:` of `cockpit-image-builder`, so it resolves silently and you
+  never learn the name changed. Check a rename with
+  `dnf repoquery --whatprovides <name>` against the RHEL 10 repos before
+  trusting a package list carried over from a RHEL 9 blueprint.
 - **The composed image is a build artifact, not storage.** Assume a limited
   life in Red Hat's project; Part 2 is what makes it durable.
 - **`infra.osbuild` is not relevant here.** It drives an on-prem composer

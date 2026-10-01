@@ -14,6 +14,8 @@ customizations:
   packages:
   - ansible-core
   - bash-completion
+  - buildah
+  - ca-certificates
   - cloud-init
   - cockpit
   - cockpit-bridge
@@ -29,16 +31,27 @@ customizations:
   - cockpit-system
   - cockpit-ws
   - cockpit-ws-selinux
-  - git-core
+  - git
+  - httpd
+  - libguestfs
+  - libguestfs-bash-completion
+  - man-db
+  - mod_ssl
+  - nmap-ncat
+  - nmstate
   - pcp
   - plocate
   - podman
   - python3-psycopg2
   - rsync
   - sshpass
+  - stress-ng
+  - subscription-manager
   - subscription-manager-cockpit
   - tar
   - tmux
+  - tree
+  - tuned
   - vim-enhanced
   - wget
   services:
