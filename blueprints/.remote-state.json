@@ -7,9 +7,9 @@
     },
     "lab-base-rhel-10.2": {
         "id": "5c0d32c3-a75e-4372-86bf-e8c001128391",
-        "last_modified_at": "2026-10-01T19:41:06Z",
+        "last_modified_at": "2026-10-01T21:47:24Z",
         "name": "lab-base-rhel-10.2",
-        "version": 6
+        "version": 7
     },
     "rhel-10-2-eus": {
         "id": "0c053b98-43c9-46f9-b3e8-b380c1813144",
