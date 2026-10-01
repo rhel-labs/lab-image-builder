@@ -21,8 +21,6 @@ customizations:
   - cockpit-bridge
   - cockpit-doc
   - cockpit-files
-  - cockpit-image-builder
-  - cockpit-machines
   - cockpit-ostree
   - cockpit-packagekit
   - cockpit-podman
@@ -33,8 +31,6 @@ customizations:
   - cockpit-ws-selinux
   - git
   - httpd
-  - libguestfs
-  - libguestfs-bash-completion
   - man-db
   - mod_ssl
   - nmap-ncat
