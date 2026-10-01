@@ -210,6 +210,87 @@ so the two stay in step and neither guard fires. Reach for it when you have
 deliberately decided the local file is authoritative — adopting a blueprint
 that predates this repo, or stamping over console-side experimentation.
 
+## Building from CI
+
+`.github/workflows/build-image.yml` composes a blueprint when it is committed,
+so nobody has to remember to. It runs Part 1 only; the import stays manual
+until you turn it on.
+
+**Triggers.** A push to `main` that changes any `blueprints/*.yml`, and
+`workflow_dispatch` for a build on demand:
+
+```sh
+gh workflow run build-image.yml -f blueprint=lab-base-rhel-10.2
+gh workflow run build-image.yml -f blueprint=lab-base-rhel-10.2 -f dry_run=true
+gh run watch
+```
+
+A commit touching several blueprints builds all of them, one at a time.
+Deleting a blueprint does not try to build it. `dry_run` runs
+`pull-blueprints.yml` instead of composing and then throws the working tree
+away — about thirty seconds to prove the secrets, the credentials file and
+`rh_auth` all work. Note what it does *not* prove: pull needs no
+content-sources permissions, so it can pass while `POST /compose` is still
+unauthorised.
+
+**Setup.** Two repository secrets, under *Settings → Secrets and variables →
+Actions*:
+
+| Name | Value |
+| --- | --- |
+| `RH_CLIENT_ID` | the service account's client id |
+| `RH_CLIENT_SECRET` | its secret |
+
+The workflow writes them to `~/.config/redhat/lab-images.env` on the runner at
+mode `0600`, because `rh_auth` reads a file and has no environment-variable
+fallback. That is the only setup. The runner installs `ansible-core` and
+nothing else — every role here is pure `ansible.builtin`.
+
+**The manifest.** `.build/` is gitignored, so each successful build uploads its
+manifest as a workflow artifact named `build-manifest-<slug>`, kept 90 days.
+To run Part 2 against a CI build:
+
+```sh
+gh run download <run-id> -n build-manifest-lab-base-rhel-10.2 -D .build
+ansible-playbook import-image.yml
+```
+
+**The bot commit.** Every run that changes `blueprints/.remote-state.json`
+commits it back to `main` as `github-actions[bot]`. This is not bookkeeping —
+it is what keeps [the drift guard](#the-drift-guard) from wedging the repo. CI
+bumps the version on the server; if that is never recorded here, the next run
+reads CI's own push as somebody's console edit and refuses to go. The step is
+`if: always()` for the same reason the reconcile is in Ansible's `always:`: a
+*failed* compose still bumped the version.
+
+That commit does not retrigger the workflow, for two independent reasons —
+the path filter is `blueprints/*.yml` and the bot touches only
+`.remote-state.json`, and GitHub does not start runs from pushes made with
+`GITHUB_TOKEN`. No `[skip ci]` convention is needed.
+
+**Safety on a public repo.** The only triggers are `push` to `main`, which
+needs write access, and `workflow_dispatch`. There is no `pull_request_target`
+— a fork's pull request can never reach the secrets. Keep it that way.
+
+### Turning the import on
+
+The `import` job at the bottom of the workflow is Part 2, written but inert.
+It runs only when the `ENABLE_IMPORT` repository *variable* is set to `true`,
+and it needs three things first:
+
+1. **Workload Identity Federation** in the target project, bound to this repo,
+   plus a CI service account with compute admin and `storage.objectAdmin` on
+   the export bucket. Set `GCP_WORKLOAD_IDENTITY_PROVIDER` and
+   `GCP_SERVICE_ACCOUNT` as repository variables. No key file: the job
+   requests an OIDC token, which is why it carries `id-token: write`.
+2. **`lab_share_with_accounts` must name that service account**, and sharing
+   happens at *compose* time. Flipping the switch does not make images that
+   were already built importable by CI — they need rebuilding. This is the one
+   field coupling the two parts, and it is the easy thing to miss.
+3. **`verify=false` to begin with**, which is what the job passes. The verify
+   phase SSHes to the throwaway VM; from a GitHub runner that needs port 22
+   reachable or IAP configured, and that is a separate piece of work.
+
 ## Targets
 
 A target is "everywhere an image can land", named. Adding an environment is
@@ -441,6 +522,15 @@ The image is already imported and unaffected by any of that — re-run with
   our own write as somebody else's console edit, wedging the repo until
   someone forces past it — which defeats the guard. The upsert and the
   reconcile are one `block`/`always` unit for that reason.
+- **CI must not merge the state file, it must re-apply its own key.** The
+  obvious write-back is commit-then-rebase, and it is a trap: the file is
+  sorted JSON, six lines per blueprint, so two builds recording *neighbouring*
+  keys put their changes within a hunk's context of each other and git may
+  conflict on an edit that is not actually a conflict. A conflict there wedges
+  the repo, which is the thing the write-back exists to prevent. The workflow
+  reads back the one key it is entitled to have changed, resets to current
+  `main`, and re-applies it with `jq -S --indent 4` — which reproduces
+  Ansible's `to_nice_json(sort_keys=True)` byte for byte.
 - **The access token expires after 900s and a GCP compose routinely runs
   longer.** A single poll loop would outlive its own token and start 401ing
   mid-build. Polling is split into cycles that re-authenticate first; see
@@ -511,6 +601,8 @@ ansible.cfg
 inventory.yml                     localhost, connection: local
 group_vars/all/main.yml           endpoints, delivery target, targets, defaults
 docs/service-account.md           console-side RBAC setup
+.github/workflows/
+  build-image.yml                 compose on commit; import job present, off
 blueprints/
   lab-base-rhel-10.2.yml          edit these
   .remote-state.json              slug -> id + version (committed)

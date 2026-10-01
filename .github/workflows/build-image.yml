@@ -1,0 +1,258 @@
+---
+# Compose a blueprint at Red Hat when it is committed.
+#
+# This is Part 1 only. The finished image lands in Red Hat's GCP project shared
+# to whoever lab_share_with_accounts names, and the build manifest comes back as
+# a workflow artifact for import-image.yml to pick up. The `import` job at the
+# bottom is Part 2, present but switched off — see README, "Building from CI".
+name: Build image
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - 'blueprints/*.yml'
+  workflow_dispatch:
+    inputs:
+      blueprint:
+        description: 'Blueprint slug (the filename in blueprints/ without .yml)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Prove the credentials reach the API without composing'
+        type: boolean
+        default: false
+
+# One build at a time. Two concurrent runs would race on
+# blueprints/.remote-state.json and on pushing it back.
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
+jobs:
+  # Which blueprints did this commit touch? Emitted as a JSON array so the build
+  # job can fan out over it. Plain git rather than a changed-files action: this
+  # repo takes no dependencies it does not need, and a third-party action on a
+  # public repo with secrets is a dependency worth not having.
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      blueprints: ${{ steps.pick.outputs.blueprints }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Work out what to build
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          WANTED: ${{ inputs.blueprint }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = workflow_dispatch ]; then
+            names="$WANTED"
+          else
+            # A force-push, or the first push to a branch, leaves `before`
+            # pointing at something that is not in this clone.
+            if ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              BEFORE="$AFTER^"
+            fi
+            # --diff-filter=d: deleting a blueprint must not try to build it.
+            names=$(git diff --name-only --diff-filter=d "$BEFORE" "$AFTER" \
+                      -- 'blueprints/*.yml' \
+                    | xargs -r -n1 basename \
+                    | sed 's/\.yml$//')
+          fi
+
+          json=$(printf '%s\n' "$names" | sed '/^$/d' | jq -R . | jq -sc .)
+          echo "blueprints=$json" >> "$GITHUB_OUTPUT"
+          echo "Will build: $json" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: select
+    if: needs.select.outputs.blueprints != '[]'
+    runs-on: ubuntu-latest
+    # The poll ceiling is ~63 min (lab_poll_cycles x retries x delay), so a
+    # healthy-but-slow compose must not be killed as a hung job.
+    timeout-minutes: 80
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      # Serial. Each build rewrites and pushes the same state file.
+      max-parallel: 1
+      matrix:
+        blueprint: ${{ fromJSON(needs.select.outputs.blueprints) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Every role in this repo is pure ansible.builtin. No collections.
+      - name: Install Ansible
+        run: pip install 'ansible-core>=2.16'
+
+      # rh_auth reads a file and has no environment-variable fallback, so the
+      # secrets have to be materialised at the path group_vars expects.
+      - name: Write the service account credentials
+        env:
+          RH_CLIENT_ID: ${{ secrets.RH_CLIENT_ID }}
+          RH_CLIENT_SECRET: ${{ secrets.RH_CLIENT_SECRET }}
+        run: |
+          set -eu
+          if [ -z "${RH_CLIENT_ID}" ] || [ -z "${RH_CLIENT_SECRET}" ]; then
+            echo "::error::RH_CLIENT_ID and RH_CLIENT_SECRET are not set." \
+                 "Add them under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          mkdir -p ~/.config/redhat
+          umask 077
+          {
+            printf 'RH_CLIENT_ID=%s\n' "$RH_CLIENT_ID"
+            printf 'RH_CLIENT_SECRET=%s\n' "$RH_CLIENT_SECRET"
+          } > ~/.config/redhat/lab-images.env
+
+      # Pull hits the same API with the same token, so it proves the secrets,
+      # the credentials file and rh_auth for free. It does NOT prove the
+      # content-sources RBAC that POST /compose additionally needs.
+      - name: Dry run
+        if: ${{ inputs.dry_run }}
+        env:
+          BLUEPRINT: ${{ matrix.blueprint }}
+        run: |
+          set -eu
+          ansible-playbook pull-blueprints.yml -e "blueprint=$BLUEPRINT"
+          git checkout -- .
+          echo "Credentials reach the API. Nothing was composed." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compose the image
+        if: ${{ !inputs.dry_run }}
+        env:
+          BLUEPRINT: ${{ matrix.blueprint }}
+        run: ansible-playbook build-image.yml -e "blueprint=$BLUEPRINT"
+
+      # Must run on failure too. rh_blueprint_push reconciles the state file
+      # inside an `always:` block, so a failed compose still leaves the version
+      # changed on disk — and a version that landed on the server without being
+      # recorded here makes the next run's drift guard read our own push as
+      # somebody's console edit, which wedges the repo.
+      - name: Record the blueprint version
+        if: ${{ always() && !inputs.dry_run }}
+        env:
+          BLUEPRINT: ${{ matrix.blueprint }}
+        run: |
+          set -euo pipefail
+
+          STATE=blueprints/.remote-state.json
+
+          if git diff --quiet -- "$STATE"; then
+            echo "No version change to record."
+            exit 0
+          fi
+
+          # The one key this build is entitled to have changed.
+          entry=$(jq -c --arg k "$BLUEPRINT" '.[$k]' "$STATE")
+          if [ "$entry" = null ]; then
+            echo "::warning::$STATE changed but holds no entry for" \
+                 "$BLUEPRINT. Not pushing."
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email \
+            '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # Re-apply that key onto whatever main holds *now*, rather than
+          # rebasing our diff onto it. A build can hold this checkout for an
+          # hour, and the next blueprint in the matrix — or a person — may
+          # have recorded a different one meanwhile. The file is sorted JSON
+          # six lines per key, so two neighbouring keys changing is precisely
+          # the merge git is worst at, and a conflict here wedges the repo.
+          # jq -S --indent 4 reproduces Ansible's to_nice_json byte for byte.
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git reset --hard FETCH_HEAD   # .build/ is untracked and survives
+
+            jq -S --indent 4 --arg k "$BLUEPRINT" --argjson v "$entry" \
+              '.[$k] = $v' "$STATE" > "$RUNNER_TEMP/state.json"
+            mv "$RUNNER_TEMP/state.json" "$STATE"
+
+            if git diff --quiet -- "$STATE"; then
+              echo "Already recorded on main."
+              exit 0
+            fi
+
+            git commit -m "Record $BLUEPRINT version from CI build" -- "$STATE"
+            if git push origin HEAD:main; then
+              echo "Recorded $BLUEPRINT $(jq -r .version <<<"$entry")." \
+                >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Push attempt $attempt lost a race; retrying."
+            sleep 5
+          done
+
+          echo "::error::Could not push the updated $STATE. Until it is" \
+               "committed by hand the next build will stop at the drift guard."
+          exit 1
+
+      - name: Upload the build manifest
+        if: ${{ success() && !inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-manifest-${{ matrix.blueprint }}
+          path: .build/*.json
+          if-no-files-found: error
+          retention-days: 90
+
+  # ─── Part 2, wired but off ─────────────────────────────────────────────────
+  # Does nothing until the ENABLE_IMPORT repository variable is set to "true".
+  # Read "Turning the import on" in the README first — it needs GCP Workload
+  # Identity Federation, and lab_share_with_accounts has to name the CI service
+  # account *before* the image is composed, so switching it on does not make
+  # already-built images importable.
+  import:
+    needs: [select, build]
+    if: ${{ vars.ENABLE_IMPORT == 'true' && !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Ansible
+        run: pip install 'ansible-core>=2.16'
+
+      - name: Fetch the build manifests
+        uses: actions/download-artifact@v4
+        with:
+          path: .build
+          pattern: build-manifest-*
+          merge-multiple: true
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # verify=false to begin with: the verify phase SSHes to a throwaway VM,
+      # which from a GitHub runner needs port 22 reachable or IAP configured.
+      - name: Import into GCP
+        run: ansible-playbook import-image.yml -e verify=false
