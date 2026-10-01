@@ -12,15 +12,37 @@
 # appears — a comment here would not survive the next pull.
 customizations:
   packages:
+  - ansible-core
   - bash-completion
+  - cockpit
+  - cockpit-bridge
+  - cockpit-doc
+  - cockpit-files
+  - cockpit-image-builder
+  - cockpit-machines
+  - cockpit-ostree
+  - cockpit-packagekit
+  - cockpit-podman
+  - cockpit-session-recording
+  - cockpit-storaged
+  - cockpit-system
+  - cockpit-ws
+  - cockpit-ws-selinux
   - git-core
+  - podman
+  - python3-psycopg2
+  - rsync
+  - sshpass
+  - subscription-manager-cockpit
   - tar
   - vim-enhanced
+  - wget
   services:
     enabled:
+    - cockpit.socket
     - sshd
   timezone:
     timezone: UTC
-description: Minimal RHEL 10.2 lab base
+description: RHEL 10.2 lab base with cockpit, podman and ansible-core
 distribution: rhel-10.2
 name: lab-base-rhel-10.2
