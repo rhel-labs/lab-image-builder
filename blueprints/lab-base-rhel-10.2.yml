@@ -30,6 +30,7 @@ customizations:
   - cockpit-ws
   - cockpit-ws-selinux
   - git-core
+  - plocate
   - podman
   - python3-psycopg2
   - rsync
