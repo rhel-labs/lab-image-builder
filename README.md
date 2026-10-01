@@ -9,7 +9,7 @@ The work is split in two:
 | --- | --- | --- |
 | Playbooks | `pull-blueprints.yml`, `build-image.yml` | `import-image.yml` |
 | Input | `blueprints/<name>.yml` | `.build/*.json` |
-| Output | image in **Red Hat's** GCP project, shared to us | image + family in your project |
+| Output | image in **Red Hat's** GCP project, shared to us | image + family in your project, disk file in a bucket |
 | Credentials | Red Hat service account | your own gcloud login |
 
 The split is not arbitrary. Image Builder's GCP target always writes into
@@ -19,7 +19,9 @@ is a separate job with separate credentials, so it is a separate playbook.
 
 Part 2 does not just copy. For each image it boots a throwaway VM, runs your
 configuration playbooks against it, runs a list of checks, and deletes the VM
-— or leaves it running if anything failed.
+— or leaves it running if anything failed. Images that pass are then exported
+to Cloud Storage as a portable disk file, for everything that cannot consume a
+GCE image.
 
 ## Prerequisites
 
@@ -101,6 +103,11 @@ ansible-playbook import-image.yml -e target=staging
 # Copy only; or copy and verify without the convention-named config playbooks
 ansible-playbook import-image.yml -e verify=false
 ansible-playbook import-image.yml -e provision=provision/rhsm.yml
+
+# Skip the bucket export, send it somewhere else, or overwrite what is there
+ansible-playbook import-image.yml -e export=false
+ansible-playbook import-image.yml -e export_bucket=my-bucket -e export_format=vmdk
+ansible-playbook import-image.yml -e force_export=true
 ```
 
 `import-image.yml` reads `.build/*.json` and nothing else, so it can be
@@ -218,7 +225,9 @@ lab_targets:
     zone: us-central1-a
     network: default
     machine_type: e2-medium
+    export_bucket: rhdp_images
     provision: []      # optional, extra config playbooks for this target only
+    export_format: ""  # optional, overrides lab_export_format
 ```
 
 `machine_type` and `network` are only ever used by the throwaway verify VM.
@@ -351,6 +360,61 @@ non-zero at the very end so the table is always printed first.
 A failure does not un-import anything. The image is in the project; the
 result tells you not to point a lab at the family yet.
 
+## Exporting to a bucket
+
+Every image that passes is written to Cloud Storage as a portable disk file —
+the handoff to anything that cannot consume a GCE image: RHDP, a libvirt host,
+another cloud.
+
+```
+gs://rhdp_images/lab-base-rhel-10-2-20261001-1954.qcow2
+```
+
+The object name is `<prefix><image name>.<format>`, so it carries the same
+compose timestamp the image does and an export can always be traced back to
+the build it came from.
+
+```yaml
+export: true                  # -e export=false to skip
+lab_export_bucket: rhdp_images
+lab_export_format: qcow2      # qcow2, vmdk, vhdx, vpc, vdi, or "" for native
+lab_export_prefix: ""         # e.g. "rhel-10/" if the bucket needs organising
+lab_export_timeout: 2h
+force_export: false
+```
+
+Bucket and format resolve in that order of specificity: `-e export_bucket=`
+beats the target's `export_bucket`, which beats `lab_export_bucket`. An empty
+`export_format` means gcloud's native export — a tarred, gzipped `disk.raw` —
+and the object is named `.tar.gz` to match. `gs://rhdp_images` already
+standardises on qcow2, which is why that is the default here.
+
+**Only images that passed are exported.** An export is an artifact other
+people pick up and use, and publishing one this repo has just failed its own
+checks on is worse than publishing nothing. `-e verify=false` skips the checks
+and exports anyway; that is the deliberate way to say you know.
+
+Three things worth knowing before the first run:
+
+- **It blocks with no output.** `gcloud compute images export` runs a Cloud
+  Build job that boots a temporary VM, reads the disk and converts it —
+  measured at 4 minutes for the 20 GB RHEL 10.2 image, giving a 2.2 GiB
+  qcow2. Allow longer for a bigger disk or a busy zone. The playbook prints a
+  console link and a `gcloud builds list` before it blocks.
+- **Re-running is free.** An existing object at the same URI is left alone and
+  reported, because a collision means the same compose, never a newer one.
+  `-e force_export=true` overwrites.
+- **It fails for things that are not your permissions.** The export needs
+  `cloudbuild.googleapis.com` enabled, the **Cloud Build** service account to
+  hold `roles/storage.objectAdmin` on the bucket, and the Compute Engine
+  default service account to exist and be enabled — and it can simply lose a
+  race for capacity (`ZONE_RESOURCE_POOL_EXHAUSTED`, seen in this project).
+  All four surface as the same generic build failure, so the playbook names
+  them in the error.
+
+The image is already imported and unaffected by any of that — re-run with
+`-e verify=false` to retry just the export.
+
 ## Notes from building this
 
 - **`GET /blueprints/{id}/export` is the wrong endpoint**, despite looking
@@ -425,6 +489,12 @@ result tells you not to point a lab at the family yet.
   for a reason that has nothing to do with the image.
 - **`gcloud compute ssh --tunnel-through-iap=false` is not a thing.** It is
   a flag, not a boolean with a value form, and passing one is a hard error.
+- **The export's Cloud Build job is regional, and nothing tells you.**
+  Passing `--zone us-central1-a` runs the build in `us-central1`, so a plain
+  `gcloud builds list` — and the console's default view — show global builds
+  only and the job appears to have never existed. You need
+  `--region us-central1` on both `builds list` and `builds log`. The
+  playbook prints both commands already pinned to the right region.
 
 ## Layout
 
@@ -451,6 +521,7 @@ roles/
   gcp_target/                     resolve target, preflight gcloud
   gcp_import/                     copy RH image -> our project + family
   gcp_verify/                     boot, configure, test, tear down
+  gcp_export/                     image -> disk file in a bucket
 pull-blueprints.yml
 build-image.yml
 import-image.yml

@@ -32,6 +32,7 @@
     - name: Start a results table
       ansible.builtin.set_fact:
         lab_test_results: []
+        lab_exported: []
 
     - name: Verify each image
       ansible.builtin.include_role:
@@ -76,7 +77,47 @@
           across {{ lab_imported | length }} image(s).
       when: verify | bool
 
-    # Last, so the table above is always printed. The images are already in
+    # Only images that passed. Export runs a Cloud Build job for 10-25
+    # minutes and produces an artifact other people will pick up and use —
+    # publishing one this repo just failed is worse than not publishing.
+    - name: Export each image that passed
+      ansible.builtin.include_role:
+        name: gcp_export
+      loop: "{{ lab_imported }}"
+      loop_control:
+        loop_var: lab_image
+        label: "{{ lab_image.name }}"
+      when:
+        - export | bool
+        - lab_test_results | selectattr('image', 'eq', lab_image.name)
+          | rejectattr('ok', 'eq', 'pass') | list | length == 0
+
+    - name: Report the exports
+      ansible.builtin.debug:
+        msg: |
+          In Cloud Storage:
+          {% for u in lab_exported %}
+            {{ u }}
+          {% endfor %}
+      when: lab_exported | default([]) | length > 0
+
+    - name: Report images that were not exported
+      ansible.builtin.debug:
+        msg: >-
+          {{ _skipped | join(', ') }} failed verification and
+          {{ (_skipped | length > 1) | ternary('were', 'was') }} not exported.
+          Fix the blueprint and rebuild, or re-run with -e verify=false to
+          export anyway.
+      vars:
+        _failed: >-
+          {{ lab_test_results | rejectattr('ok', 'eq', 'pass')
+             | map(attribute='image') | unique | list }}
+        _skipped: "{{ lab_imported | map(attribute='name') | select('in', _failed) | list }}"
+      when:
+        - export | bool
+        - _skipped | length > 0
+
+    # Last, so the tables above are always printed. The images are already in
     # the project either way — a failed check does not un-import anything,
     # it tells you not to point a lab at the family yet.
     - name: Fail if anything did not pass

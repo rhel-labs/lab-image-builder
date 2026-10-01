@@ -78,14 +78,17 @@ force_push: false
 # VM — this repo does not create lab VMs, it only publishes images for them.
 target: lab
 
-# A target may also carry `provision:` — a list of extra configuration
-# playbooks to run only when importing there.
+# A target may also carry:
+#   provision:      extra configuration playbooks, run only for this target
+#   export_bucket:  a different bucket than lab_export_bucket
+#   export_format:  a different disk format than lab_export_format
 lab_targets:
   lab:
     project: tmm-instruqt-11-26-2021
     zone: us-central1-a
     network: default
     machine_type: e2-medium
+    export_bucket: rhdp_images
 
 # ─── Verification ────────────────────────────────────────────────────────────
 # Each imported image is booted as a throwaway VM, configured, tested over
@@ -115,3 +118,33 @@ lab_boot_delay: 10
 # that actually broke. It is deleted on success. Set false to always delete —
 # useful in CI, where nobody is going to log in and look.
 lab_keep_on_failure: true
+
+# ─── Export to a bucket ──────────────────────────────────────────────────────
+# After an image passes, write a portable disk file to Cloud Storage. This is
+# what gets handed to anything that cannot consume a GCE image — RHDP, a
+# local libvirt host, another cloud.
+export: true
+
+# Resolution order: -e export_bucket= beats the target's export_bucket, which
+# beats lab_export_bucket. Same for the format.
+export_bucket: ""
+lab_export_bucket: rhdp_images
+
+# qemu-img formats: qcow2, vmdk, vhdx, vpc, vdi. Empty exports the native GCE
+# format instead — a tarred, gzipped disk.raw.
+export_format: ""
+lab_export_format: qcow2
+
+# Object name: <prefix><image name>.<format>. The prefix is where to put a
+# "lab/" or "rhel-10/" if the bucket ever needs organising.
+lab_export_prefix: ""
+
+# Export runs a Cloud Build job that boots a temporary VM and converts the
+# disk. It takes 10-25 minutes for a 20 GB image and gcloud's own ceiling is
+# 2h; it is by far the slowest thing in this repo.
+lab_export_timeout: 2h
+
+# Exporting over an object that already exists requires saying so. The object
+# name is derived from the image name, which embeds the compose timestamp, so
+# a collision means the same build — not a newer one.
+force_export: false

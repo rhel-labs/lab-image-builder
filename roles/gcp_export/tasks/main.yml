@@ -1,0 +1,169 @@
+---
+# Write one imported image to Cloud Storage as a portable disk file.
+# Called once per entry in lab_imported, with lab_image set.
+#
+# This is the handoff to everything that cannot consume a GCE image. It is
+# also the slowest thing in this repo by a wide margin: gcloud runs a Cloud
+# Build job that boots a temporary VM, dd's the disk and converts it.
+
+- name: Resolve the export settings
+  ansible.builtin.set_fact:
+    lab_bucket: >-
+      {{ export_bucket | default('', true)
+         or lab_target.export_bucket | default('', true)
+         or lab_export_bucket | default('', true) }}
+    lab_format: >-
+      {{ export_format | default('', true)
+         or lab_target.export_format | default('', true)
+         or lab_export_format | default('', true) }}
+
+- name: Assert a bucket was named
+  ansible.builtin.assert:
+    that: lab_bucket | length > 0
+    fail_msg: >-
+      Nothing to export to. Set lab_export_bucket in group_vars/all/main.yml,
+      or export_bucket on target "{{ target }}", or pass -e export_bucket=...
+      Skip the export entirely with -e export=false.
+    quiet: true
+
+# Empty format means gcloud's native export: a tarred, gzipped disk.raw.
+# The extension has to follow, or the object lies about its contents.
+- name: Derive the destination
+  ansible.builtin.set_fact:
+    lab_export_uri: >-
+      gs://{{ lab_bucket }}/{{ lab_export_prefix }}{{ lab_image.name }}.{{
+        (lab_format | length > 0) | ternary(lab_format, 'tar.gz') }}
+
+- name: Confirm the bucket is reachable
+  ansible.builtin.command: >-
+    gcloud storage buckets describe gs://{{ lab_bucket }}
+    --project {{ lab_target.project }}
+    --format=value(name)
+  register: lab_bucket_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail if the bucket is unreachable
+  ansible.builtin.fail:
+    msg: |
+      Cannot read gs://{{ lab_bucket }} as {{ lab_gcloud_identity }}.
+
+      {{ lab_bucket_check.stderr | default('') | trim }}
+
+      Either the bucket name is wrong, or this account lacks
+      storage.buckets.get on it. The export itself additionally needs write
+      access for the Cloud Build service account, not just for you.
+  when: lab_bucket_check.rc | default(1) | int != 0
+
+- name: Look for an existing export
+  ansible.builtin.command: >-
+    gcloud storage objects describe {{ lab_export_uri }}
+    --format=value(size)
+  register: lab_export_existing
+  changed_when: false
+  failed_when: false
+
+# The object name is derived from the image name, which embeds the compose
+# timestamp — so an object already being there means the same build, not an
+# older one. Overwriting is therefore never what you want by accident, and
+# re-running the playbook is free rather than a 20 minute no-op.
+- name: Report a skipped export
+  ansible.builtin.debug:
+    msg: >-
+      {{ lab_export_uri }} already exists
+      ({{ (lab_export_existing.stdout | trim | int / 1048576) | round | int }} MiB).
+      Nothing to do — pass -e force_export=true to overwrite it.
+  when:
+    - lab_export_existing.rc | default(1) | int == 0
+    - not (force_export | bool)
+
+- name: Export the image
+  when: >-
+    (lab_export_existing.rc | default(1) | int != 0) or (force_export | bool)
+  block:
+    # The build is regional — it lands in the region holding lab_target.zone,
+    # not in global, so neither the default console view nor a bare
+    # `gcloud builds list` will show it. Both links below are pinned.
+    - name: Warn how long this takes
+      ansible.builtin.debug:
+        msg: |
+          Exporting {{ lab_image.name }} to {{ lab_export_uri }}. This runs a
+          Cloud Build job in {{ _region }} and produces no output until it
+          finishes — about 4 minutes for a 20 GB RHEL image, longer for a
+          bigger disk or a busy zone.
+
+            https://console.cloud.google.com/cloud-build/builds;region={{ _region }}?project={{ lab_target.project }}
+            gcloud builds list --project {{ lab_target.project }} --region {{ _region }}
+      vars:
+        _region: "{{ lab_target.zone | regex_replace('-[a-z]$', '') }}"
+
+    - name: Run the export
+      ansible.builtin.command:
+        argv: "{{ _base + _fmt }}"
+      vars:
+        _base:
+          - gcloud
+          - compute
+          - images
+          - export
+          - "--project={{ lab_target.project }}"
+          - "--image={{ lab_image.name }}"
+          - "--destination-uri={{ lab_export_uri }}"
+          - "--zone={{ lab_target.zone }}"
+          - "--network={{ lab_target.network }}"
+          - "--timeout={{ lab_export_timeout }}"
+        _fmt: "{{ (lab_format | length > 0) | ternary(['--export-format=' ~ lab_format], []) }}"
+      register: lab_export_run
+      changed_when: lab_export_run.rc == 0
+      failed_when: false
+
+    # Export is the one step that fails for reasons outside this project's
+    # compute permissions: it needs the Cloud Build API on, and the Cloud
+    # Build service account needs write access to the bucket. Both read as
+    # generic build failures.
+    - name: Fail with the export error
+      ansible.builtin.fail:
+        msg: |
+          Exporting {{ lab_image.name }} to {{ lab_export_uri }} failed
+          ({{ lab_export_run.rc }}).
+
+          {{ lab_export_run.stderr | default('') | trim | truncate(2000) }}
+
+          The usual causes, none of which say so plainly:
+            - cloudbuild.googleapis.com is not enabled on
+              {{ lab_target.project }}
+            - the Cloud Build service account cannot write to
+              gs://{{ lab_bucket }} (needs roles/storage.objectAdmin)
+            - the Compute Engine default service account is missing or
+              disabled — export boots a temporary VM that uses it
+            - ZONE_RESOURCE_POOL_EXHAUSTED — the zone had no capacity for
+              that temporary VM. Nothing is wrong; retry, or point the
+              target at another zone.
+
+          The full log, in the region the build ran in rather than global:
+            gcloud builds list --project {{ lab_target.project }} --region {{ _region }}
+            gcloud builds log <id> --project {{ lab_target.project }} --region {{ _region }}
+
+          The image itself is imported and unaffected. Re-run with
+          -e verify=false to retry just the export.
+      vars:
+        _region: "{{ lab_target.zone | regex_replace('-[a-z]$', '') }}"
+      when: lab_export_run.rc != 0
+
+    - name: Confirm the object landed
+      ansible.builtin.command: >-
+        gcloud storage objects describe {{ lab_export_uri }}
+        --format=value(size)
+      register: lab_export_landed
+      changed_when: false
+
+    - name: Report the export
+      ansible.builtin.debug:
+        msg: >-
+          Exported {{ lab_image.name }} to {{ lab_export_uri }}
+          ({{ (lab_export_landed.stdout | trim | int / 1073741824)
+              | round(2) }} GiB).
+
+- name: Record the export
+  ansible.builtin.set_fact:
+    lab_exported: "{{ lab_exported | default([]) + [lab_export_uri] }}"
