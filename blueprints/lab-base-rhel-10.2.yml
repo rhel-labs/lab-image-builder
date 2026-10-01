@@ -36,6 +36,7 @@ customizations:
   - sshpass
   - subscription-manager-cockpit
   - tar
+  - tmux
   - vim-enhanced
   - wget
   services:
