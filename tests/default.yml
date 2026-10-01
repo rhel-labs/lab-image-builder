@@ -1,0 +1,60 @@
+---
+# Checks that must hold for every image this repo publishes, whatever the
+# blueprint. Blueprint-specific ones go in tests/<blueprint-slug>.yml, which
+# is appended to this file rather than replacing it.
+#
+#   name           what appears in the report          required
+#   command        shell, run over SSH on the VM       required
+#   expect_rc      exit code; default 0, `any` to skip optional
+#   expect_stdout  regex, searched anywhere in stdout  optional
+#
+# `command` is templated by Ansible before it runs, so a literal {{ or {%
+# has to be wrapped in {% raw %}...{% endraw %}. Shell quoting is safe —
+# the command reaches the remote shell byte for byte. Anything needing root
+# must say `sudo`; the login is unprivileged.
+
+# `status: done` is the assertion; the exit code is not. cloud-init exits 2
+# for "done, with recoverable errors", and on GCP it always has one:
+# cloud-init-local runs before metadata.google.internal resolves, retries,
+# and finds DataSourceGCE on a later attempt. A real failure still says
+# `status: error`, which this catches.
+- name: cloud-init finished and found the GCE datasource
+  command: cloud-init status --wait --long
+  expect_rc: any
+  expect_stdout: 'status: done'
+
+- name: no systemd unit failed to start
+  command: systemctl --failed --no-legend --plain | wc -l
+  expect_stdout: '^0$'
+
+- name: SELinux is enforcing
+  command: getenforce
+  expect_stdout: '^Enforcing$'
+
+- name: the clock is UTC
+  command: timedatectl show -p Timezone --value
+  expect_stdout: '^UTC$'
+
+# Every account should be locked (`!`) or have no password at all (`*`).
+# This is the one that would catch a password baked in by a `users:` block
+# in the blueprint, including for root.
+- name: no account has a usable password
+  command: "sudo awk -F: '$2 !~ /^[!*]/ {print $1}' /etc/shadow | wc -l"
+  expect_stdout: '^0$'
+
+# cloud-init creates cloud-user on every RHEL cloud image. With no key in it
+# the account is inert, which is what we want; a key here would be a way in
+# that nobody in GCP IAM granted.
+#
+# The other accounts with real uids on a running VM are created at boot by
+# the guest agent from project-wide SSH keys — they are a property of the
+# GCP project, not of the image, and are listed in /var/lib/google/google_users.
+- name: cloud-user has no authorized key
+  command: sudo test ! -s /home/cloud-user/.ssh/authorized_keys
+
+# subscription-manager exits 1 when the system is not registered. An image
+# that arrives registered leaks one entitlement into every VM cloned from it.
+- name: no subscription is baked in
+  command: sudo subscription-manager status
+  expect_rc: 1
+  expect_stdout: 'Overall Status: Not registered'

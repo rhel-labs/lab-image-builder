@@ -7,17 +7,19 @@ The work is split in two:
 
 | | Part 1 — build at Red Hat | Part 2 — import to GCP |
 | --- | --- | --- |
-| Playbooks | `pull-blueprints.yml`, `build-image.yml` | `import-image.yml` *(not yet written)* |
+| Playbooks | `pull-blueprints.yml`, `build-image.yml` | `import-image.yml` |
 | Input | `blueprints/<name>.yml` | `.build/*.json` |
-| Output | image in **Red Hat's** GCP project, shared to us | image in `tmm-instruqt-11-26-2021` |
-| Credentials | Red Hat service account | gcloud ADC |
+| Output | image in **Red Hat's** GCP project, shared to us | image + family in your project |
+| Credentials | Red Hat service account | your own gcloud login |
 
 The split is not arbitrary. Image Builder's GCP target always writes into
 **Red Hat's own GCP project** and grants access to accounts you nominate —
 there is no setting that makes it write into yours. Copying the image across
 is a separate job with separate credentials, so it is a separate playbook.
 
-**Part 1 is implemented. Part 2 is not.**
+Part 2 does not just copy. For each image it boots a throwaway VM, runs your
+configuration playbooks against it, runs a list of checks, and deletes the VM
+— or leaves it running if anything failed.
 
 ## Prerequisites
 
@@ -60,8 +62,15 @@ is a separate job with separate credentials, so it is a separate playbook.
 
    Type them into the editor — not into a shell command, which lands in your
    history.
+4. **gcloud, for Part 2 only** — `brew install --cask google-cloud-sdk`, then
+   `gcloud auth login`. Part 2 drives the CLI directly: no Ansible
+   collection, no service account key, no ADC JSON.
 
-Part 1 needs no GCP credentials at all.
+   It must be authenticated as a principal in `lab_share_with_accounts`
+   (`group_vars/all/main.yml`), because that is who Image Builder shared the
+   image with. `import-image.yml` warns up front if it is not.
+
+Part 1 needs no GCP credentials at all. Part 2 needs no Red Hat ones.
 
 ## Usage
 
@@ -80,6 +89,25 @@ ansible-playbook build-image.yml -e blueprint=lab-base-rhel-10.2 -e distribution
 ansible-playbook build-image.yml -e blueprint=... -e lab_architecture=aarch64
 ansible-playbook build-image.yml -e blueprint=... -e force_push=true
 ```
+
+```sh
+# Import everything built, into the default target, and verify each image
+ansible-playbook import-image.yml
+
+# One image, or a different target
+ansible-playbook import-image.yml -e blueprint=lab-base-rhel-10.2
+ansible-playbook import-image.yml -e target=staging
+
+# Copy only; or copy and verify without the convention-named config playbooks
+ansible-playbook import-image.yml -e verify=false
+ansible-playbook import-image.yml -e provision=provision/rhsm.yml
+```
+
+`import-image.yml` reads `.build/*.json` and nothing else, so it can be
+re-run after a failure, or days later, without paying for another compose.
+It is safe to re-run: the image name embeds the compose timestamp, so the
+same compose always resolves to the same name and an existing one is left
+alone. Re-running is how you re-verify.
 
 `blueprints/*.yml` is the source of truth. `pull` takes the console's copy;
 `build` pushes the local copy up before composing. The two directions are
@@ -175,6 +203,154 @@ so the two stay in step and neither guard fires. Reach for it when you have
 deliberately decided the local file is authoritative — adopting a blueprint
 that predates this repo, or stamping over console-side experimentation.
 
+## Targets
+
+A target is "everywhere an image can land", named. Adding an environment is
+adding a key to `lab_targets` in `group_vars/all/main.yml`, not editing a
+playbook:
+
+```yaml
+target: lab            # the default; override with -e target=staging
+
+lab_targets:
+  lab:
+    project: tmm-instruqt-11-26-2021
+    zone: us-central1-a
+    network: default
+    machine_type: e2-medium
+    provision: []      # optional, extra config playbooks for this target only
+```
+
+`machine_type` and `network` are only ever used by the throwaway verify VM.
+This repo publishes images; it does not create lab VMs.
+
+## What the import produces
+
+`lab-base-rhel-10.2` composed at `2026-10-01T19:54:01Z` becomes:
+
+```
+image  lab-base-rhel-10-2-20261001-1954
+family lab-base-rhel-10-2
+```
+
+GCP resource names cannot contain dots and every RHEL point release has one,
+so the slug is sanitised. **The family is the handle labs should use** — it
+always resolves to the newest image in it, so a rebuild rolls every lab
+forward without anyone editing a lab definition:
+
+```sh
+gcloud compute instances create my-lab-vm \
+  --image-family lab-base-rhel-10-2 --image-project tmm-instruqt-11-26-2021
+```
+
+The dated name is the rollback: it never collides with what it replaces, and
+pointing at one pins a lab to that exact build. Each image carries
+`managed-by`, `blueprint`, `distribution` and `compose-id` labels, so
+`gcloud compute images describe` tells you which compose it came from.
+
+## Verifying: configure, then test
+
+With `verify` on (the default), each imported image goes through four phases
+on a throwaway VM named `verify-<image>-<random>`:
+
+| Phase | What happens |
+| --- | --- |
+| `create` | boot an instance from the image just imported |
+| `boot` | wait for metadata SSH — which also proves key injection works on an image that bakes in no users |
+| `configure` | run the playbooks in `provision/` |
+| `test` | run the checks in `tests/` over SSH |
+
+The VM gets `--no-service-account --no-scopes`. It needs to boot and answer
+SSH, nothing more, and one left behind after a failure cannot reach the rest
+of the project.
+
+### Configuration playbooks
+
+Dropped in `provision/` and picked up by name:
+
+```sh
+provision/default.yml                # every image
+provision/lab-base-rhel-10.2.yml     # that blueprint only
+lab_targets.<target>.provision       # that target only
+```
+
+All three are optional and they run in that order. To run something else for
+one run: `-e provision=provision/rhsm.yml,provision/lab-users.yml` — an
+explicit list replaces the convention entirely, and a path in it that does
+not exist is an error rather than a silent skip.
+
+**These are ordinary standalone playbooks.** Nothing in them knows about this
+repo, and `import-image.yml` shells out to `ansible-playbook` rather than
+importing them, so the same file runs by hand against a real lab VM with any
+inventory that reaches it. Write `hosts: all` and declare `become: true`
+yourself. `provision/example.yml` is a working template; it is deliberately
+*not* one of the names picked up automatically.
+
+The generated inventory sets `ansible_host`, `ansible_user` and
+`ansible_ssh_private_key_file` from `gcloud compute ssh --dry-run`, which
+prints the exact ssh command gcloud would run without running it. That is
+the only answer that is right in every case — the login name is derived from
+your account under plain metadata SSH but from the directory under OS Login,
+and guessing wrong fails as `Permission denied` with no hint which is in
+play. It also passes through the image context, so one playbook can branch:
+`lab_image_name`, `lab_image_family`, `lab_image_slug`,
+`lab_image_distribution`, `lab_gcp_project`, `lab_gcp_zone`,
+`lab_gcp_instance`, `lab_target_name`.
+
+**This configures the VM under test, not the published image.** The tests
+then run against a configured system, which is what proves the image is a
+valid base for your config management. Nothing is re-captured — if you want
+the configuration baked in, it belongs in the blueprint, or in a second
+image captured from the running VM, which this repo does not do.
+
+### Tests
+
+`tests/default.yml` runs against every image. `tests/<blueprint-slug>.yml`
+is **appended** to it, not substituted, so blueprint-specific checks are
+additions rather than a fork. Four keys:
+
+```yaml
+- name: cloud-init finished and found the GCE datasource
+  command: cloud-init status --wait --long
+  expect_rc: any                     # default 0; `any` ignores the exit code
+  expect_stdout: 'status: done'      # regex, searched anywhere in stdout
+
+- name: no account has a usable password
+  command: "sudo awk -F: '$2 !~ /^[!*]/ {print $1}' /etc/shadow | wc -l"
+  expect_stdout: '^0$'
+
+- name: no subscription is baked in
+  command: sudo subscription-manager status
+  expect_rc: 1
+```
+
+`command` reaches the remote shell byte for byte — quotes, pipes and
+`$` are all safe, because it is passed as an argv element and never goes
+through a local shell. Two things to know: anything needing root must say
+`sudo`, since the login is unprivileged; and `command` *is* templated by
+Ansible, so a literal `{{` or `{%` needs `{% raw %}`.
+
+### When something fails
+
+The VM is **kept** so you can log into the thing that actually broke, and
+the playbook prints the two commands you want:
+
+```
+4 failure(s) on lab-base-rhel-10-2-20261001-1954.
+verify-lab-base-rhel-10-2-20261001-1954-bs70 has been left running [...]
+
+  gcloud compute ssh verify-... --project ... --zone ...
+  gcloud compute instances delete verify-... --project ... --zone ... --quiet
+```
+
+Set `lab_keep_on_failure: false` to always delete — right for CI, where
+nobody is going to log in and look. Either way the report lists every check
+with the command, what was expected and what came back, and the run exits
+non-zero at the very end so the table is always printed first.
+
+A failure does not un-import anything. The image is in the project; the
+result tells you not to point a lab at the family yet.
+
 ## Notes from building this
 
 - **`GET /blueprints/{id}/export` is the wrong endpoint**, despite looking
@@ -221,23 +397,62 @@ that predates this repo, or stamping over console-side experimentation.
   life in Red Hat's project; Part 2 is what makes it durable.
 - **`infra.osbuild` is not relevant here.** It drives an on-prem composer
   socket over SSH, not the hosted API.
+- **Part 2 uses the `gcloud` CLI, not `google.cloud`.** The collection route
+  needs `ansible-galaxy collection install google.cloud` plus `google-auth`
+  plus ADC. The CLI route needs gcloud, which you already have logged in.
+  Part 1 reached the Image Builder API with nothing but `ansible.builtin.uri`
+  and this keeps the same bargain: no collections, no key files.
+- **A boolean that has been through a template is not a boolean.**
+  `{{ (a) and (b) }}` where `a` and `b` are themselves templated vars
+  compares the *strings* `"True"` and `"False"`, both of which are truthy —
+  so every test passes and the suite is worthless while looking perfect.
+  Each part needs `| bool`, and results are stored as `"pass"`/`"fail"`
+  rather than booleans for the same reason.
+- **`cloud-init status` exits 2 on a healthy GCP boot.** `cloud-init-local`
+  runs before `metadata.google.internal` resolves, logs a recoverable error,
+  retries, and finds `DataSourceGCE` on a later attempt — leaving
+  `extended_status: degraded done` and rc 2 forever. The assertion worth
+  making is `status: done`; the exit code is noise.
+- **Most accounts on a running lab VM are not in the image.** The guest
+  agent creates a local account for every project-wide SSH key at boot, so
+  counting uids over 1000 measures your GCP project, not your blueprint.
+  `/var/lib/google/google_users` is the guest agent's own list of the ones
+  it made. `cloud-user` is cloud-init's doing and is on every RHEL cloud
+  image. Checking `/etc/shadow` for a usable password is the test that
+  actually says something about the image.
+- **`subscription-manager status` needs root**, and exits 8 without it —
+  not the 1 that means "not registered". A test that forgets `sudo` fails
+  for a reason that has nothing to do with the image.
+- **`gcloud compute ssh --tunnel-through-iap=false` is not a thing.** It is
+  a flag, not a boolean with a value form, and passing one is a hard error.
 
 ## Layout
 
 ```sh
 ansible.cfg
 inventory.yml                     localhost, connection: local
-group_vars/all/main.yml           endpoints, delivery target, defaults
+group_vars/all/main.yml           endpoints, delivery target, targets, defaults
 docs/service-account.md           console-side RBAC setup
 blueprints/
   lab-base-rhel-10.2.yml          edit these
   .remote-state.json              slug -> id + version (committed)
+provision/
+  example.yml                     template; not picked up automatically
+  default.yml                     if present, runs against every image
+  <blueprint-slug>.yml            if present, that blueprint only
+tests/
+  default.yml                     checks every image must pass
+  lab-base-rhel-10.2.yml          appended for that blueprint
 roles/
   rh_auth/                        service account -> access token
   rh_blueprint_pull/              list + fetch -> local YAML
   rh_blueprint_push/              validate, drift check, upsert
   rh_compose/                     compose, poll, write manifest
+  gcp_target/                     resolve target, preflight gcloud
+  gcp_import/                     copy RH image -> our project + family
+  gcp_verify/                     boot, configure, test, tear down
 pull-blueprints.yml
 build-image.yml
+import-image.yml
 .build/                           handoff manifests (gitignored)
 ```

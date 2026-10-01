@@ -1,0 +1,138 @@
+---
+# Resolve `target` into a concrete project/zone/network and prove the local
+# gcloud can reach it, before anything is created. Everything here is a read;
+# the whole point is to turn the slow failures (an import that 403s, a boot
+# into a project we cannot see) into fast ones.
+
+- name: Assert the target is defined
+  ansible.builtin.assert:
+    that: target in lab_targets
+    fail_msg: |
+      Unknown target "{{ target }}".
+
+      Defined in group_vars/all/main.yml: {{ lab_targets.keys() | join(', ') }}
+    quiet: true
+
+- name: Resolve the target
+  ansible.builtin.set_fact:
+    lab_target: "{{ lab_targets[target] }}"
+
+- name: Assert the target is complete
+  ansible.builtin.assert:
+    that:
+      - lab_target.project | default('') | length > 0
+      - lab_target.zone | default('') | length > 0
+      - lab_target.network | default('') | length > 0
+      - lab_target.machine_type | default('') | length > 0
+    fail_msg: >-
+      Target "{{ target }}" needs project, zone, network and machine_type.
+      Got: {{ lab_target | default({}) }}
+    quiet: true
+
+- name: Check that gcloud is installed
+  ansible.builtin.command: gcloud version
+  register: lab_gcloud
+  changed_when: false
+  failed_when: false
+
+- name: Fail if gcloud is missing
+  ansible.builtin.fail:
+    msg: |
+      gcloud is not on PATH. Part 2 drives the Google Cloud CLI directly —
+      no Ansible collection, no service account key, just your own gcloud
+      credentials.
+
+        brew install --cask google-cloud-sdk
+        gcloud auth login
+  when: lab_gcloud.rc | default(1) | int != 0
+
+- name: Find the active gcloud account
+  ansible.builtin.command: gcloud auth list --filter=status:ACTIVE --format=value(account)
+  register: lab_gcloud_account
+  changed_when: false
+  failed_when: false
+
+- name: Fail if gcloud is not authenticated
+  ansible.builtin.fail:
+    msg: |
+      No active gcloud account. Run:
+
+        gcloud auth login
+
+      Part 2 runs as you, not as a service account, because the image is
+      shared to a named principal — see share_with_accounts below.
+  when: >-
+    lab_gcloud_account.rc | default(1) | int != 0
+    or (lab_gcloud_account.stdout | default('') | trim | length) == 0
+
+- name: Note the gcloud identity
+  ansible.builtin.set_fact:
+    lab_gcloud_identity: "{{ lab_gcloud_account.stdout | trim }}"
+
+# The one field Part 1 and Part 2 are coupled at. Image Builder shares the
+# image to the principals in lab_share_with_accounts; if the account running
+# the import is not among them, the source image simply will not exist as far
+# as gcloud is concerned, and the error says "not found" rather than
+# "not shared with you".
+- name: Warn if this identity is not one the image was shared with
+  ansible.builtin.debug:
+    msg: |
+      WARNING: gcloud is authenticated as {{ lab_gcloud_identity }}, which is
+      not in lab_share_with_accounts ({{ lab_share_with_accounts | join(', ') }}).
+
+      If the share was to a group this is fine. Otherwise the import will fail
+      with a not-found on the source image, and the fix is in Part 1: change
+      lab_share_with_accounts in group_vars/all/main.yml and rebuild.
+  when: ('user:' ~ lab_gcloud_identity) not in lab_share_with_accounts
+
+- name: Check access to the target project
+  ansible.builtin.command: >-
+    gcloud compute images list
+    --project {{ lab_target.project }}
+    --no-standard-images --limit 1 --format=value(name)
+  register: lab_project_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail if the target project is unreachable
+  ansible.builtin.fail:
+    msg: |
+      Cannot list images in "{{ lab_target.project }}" as {{ lab_gcloud_identity }}.
+
+      {{ lab_project_check.stderr | default('') | trim }}
+
+      Either the project id in target "{{ target }}" is wrong, or this account
+      lacks compute.images.list on it.
+  when: lab_project_check.rc | default(1) | int != 0
+
+# Same selection semantics as Part 1: -e blueprint=<slug> for one, omitted
+# for everything that has been built.
+- name: Find the build manifests
+  ansible.builtin.find:
+    paths: "{{ lab_build_dir }}"
+    patterns: "{{ (blueprint | length > 0) | ternary(blueprint ~ '.json', '*.json') }}"
+  register: lab_manifest_files
+
+- name: Fail if there is nothing to import
+  ansible.builtin.fail:
+    msg: |
+      No build manifests in {{ lab_build_dir }}{{
+        (blueprint | length > 0) | ternary(' matching "' ~ blueprint ~ '.json"', '') }}.
+
+      A manifest is written by Part 1 on a successful compose:
+
+        ansible-playbook build-image.yml -e blueprint={{ blueprint | default('<name>', true) }}
+
+      .build/ is gitignored, so a fresh clone has none even if the images
+      themselves still exist in Red Hat's project.
+  when: lab_manifest_files.matched | int == 0
+
+- name: Report the target
+  ansible.builtin.debug:
+    msg: |
+      Target "{{ target }}" as {{ lab_gcloud_identity }}
+        project : {{ lab_target.project }}
+        zone    : {{ lab_target.zone }}
+        network : {{ lab_target.network }}
+      Importing {{ lab_manifest_files.matched }} image(s):
+        {{ lab_manifest_files.files | map(attribute='path') | map('basename') | join(', ') }}

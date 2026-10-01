@@ -66,3 +66,52 @@ lab_poll_cycles: 7
 # Overwriting a blueprint someone edited in the web console is the one
 # genuinely destructive thing this repo can do. It requires -e force_push=true.
 force_push: false
+
+# ═══ Part 2 — import into GCP ════════════════════════════════════════════════
+# Nothing below is used by Part 1, and Part 1 needs no GCP credentials.
+
+# ─── Targets ─────────────────────────────────────────────────────────────────
+# A target is "everywhere an image can land", named. Adding an environment is
+# adding a key here, not editing a playbook: -e target=staging
+#
+# `machine_type` and `network` are only ever used by the throwaway smoke-test
+# VM — this repo does not create lab VMs, it only publishes images for them.
+target: lab
+
+# A target may also carry `provision:` — a list of extra configuration
+# playbooks to run only when importing there.
+lab_targets:
+  lab:
+    project: tmm-instruqt-11-26-2021
+    zone: us-central1-a
+    network: default
+    machine_type: e2-medium
+
+# ─── Verification ────────────────────────────────────────────────────────────
+# Each imported image is booted as a throwaway VM, configured, tested over
+# SSH, and deleted. -e verify=false imports and stops.
+verify: true
+
+# Configuration playbooks, run on the booted VM before any test. Ordinary
+# standalone playbooks — nothing in them knows about this repo.
+#   provision/default.yml                 every image
+#   provision/<blueprint-slug>.yml        that blueprint only
+#   lab_targets.<target>.provision        that target only
+# Both convention paths are optional. Override the lot with a comma-separated
+# list: -e provision=provision/rhsm.yml,provision/lab-users.yml
+lab_provision_dir: "{{ playbook_dir }}/provision"
+provision: ""
+
+# Checks, run after configuration.
+#   tests/default.yml                     every image
+#   tests/<blueprint-slug>.yml            that blueprint only
+lab_test_dir: "{{ playbook_dir }}/tests"
+
+# A GCP boot plus sshd plus the guest agent injecting our key. 40 x 10s.
+lab_boot_retries: 40
+lab_boot_delay: 10
+
+# On failure the VM is left running so you can SSH in and look at the thing
+# that actually broke. It is deleted on success. Set false to always delete —
+# useful in CI, where nobody is going to log in and look.
+lab_keep_on_failure: true

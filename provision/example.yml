@@ -1,0 +1,56 @@
+---
+# An example configuration playbook. Copy it to one of the two names that
+# import-image.yml picks up automatically:
+#
+#   provision/default.yml                 run against every image
+#   provision/lab-base-rhel-10.2.yml      run against that blueprint only
+#
+# or name it explicitly for one run:
+#
+#   ansible-playbook import-image.yml -e provision=provision/example.yml
+#
+# Nothing here knows about lab-image-builder. That is the point: the same
+# file runs by hand against a real lab VM with any inventory that reaches
+# it. Use `hosts: all` so it does not depend on the generated group name.
+#
+# These run on the throwaway VM, after it boots and before the tests, so
+# the tests see the configured system. They do not change the published
+# image — see "Configuring before testing" in the README.
+- name: Configure the lab image
+  hosts: all
+  become: true
+
+  # Supplied by import-image.yml, and defaulted so the playbook still runs
+  # standalone: lab_image_name, lab_image_family, lab_image_slug,
+  # lab_image_distribution, lab_gcp_project, lab_gcp_zone, lab_gcp_instance,
+  # lab_target_name.
+  vars:
+    lab_target_name: manual
+
+  tasks:
+    - name: Report what we landed on
+      ansible.builtin.debug:
+        msg: >-
+          Configuring {{ ansible_facts.distribution | default('?') }}
+          {{ ansible_facts.distribution_version | default('?') }}
+          for target "{{ lab_target_name }}"
+
+    - name: Drop a lab banner
+      ansible.builtin.copy:
+        dest: /etc/motd.d/lab
+        mode: "0644"
+        content: |
+          Lab image {{ lab_image_name | default('(unknown)') }}
+          Built by lab-image-builder. Not registered to RHSM.
+
+    # Example of a target-specific branch. `lab_target_name` is the key from
+    # lab_targets in group_vars/all/main.yml, so one playbook can configure
+    # lab and staging differently without a second copy.
+    - name: Turn on the lab's extra services
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - cockpit.socket
+      when: lab_target_name == 'lab'

@@ -1,0 +1,250 @@
+---
+# Verify one imported image on a throwaway VM, in four phases:
+#
+#   create    boot an instance from the image we just imported
+#   boot      wait for metadata SSH
+#   configure run the ordinary Ansible playbooks in provision/ against it
+#   test      run the YAML checks in tests/ over SSH
+#
+# then delete the VM — or leave it running if anything failed.
+# Called once per entry in lab_imported, with lab_image set.
+
+# These are facts, and facts outlive a loop iteration. Reset them or image
+# two inherits image one's results.
+- name: Reset per-image state
+  ansible.builtin.set_fact:
+    lab_tests: []
+    lab_image_failures: 0
+    lab_vm_exists: false
+    lab_inventory: ""
+    lab_phase: setup
+
+# ─── What to run ─────────────────────────────────────────────────────────────
+
+- name: Decide which configuration playbooks to run
+  ansible.builtin.set_fact:
+    lab_provision_wanted: >-
+      {{ (provision | length > 0) | ternary(
+           provision.split(','),
+           [lab_provision_dir ~ '/default.yml',
+            lab_provision_dir ~ '/' ~ lab_image.slug ~ '.yml']
+             + (lab_target.provision | default([]))) }}
+
+- name: Locate the configuration playbooks
+  ansible.builtin.stat:
+    path: "{{ item | trim }}"
+  loop: "{{ lab_provision_wanted }}"
+  loop_control:
+    label: "{{ item | trim | basename }}"
+  register: lab_provision_stat
+
+# Convention paths are allowed to be absent — that is what makes them a
+# convention. A path you named explicitly is not: a typo there would
+# silently configure nothing and then pass.
+- name: Fail if a named configuration playbook is missing
+  ansible.builtin.fail:
+    msg: |
+      -e provision names playbooks that do not exist:
+
+        {{ lab_provision_stat.results | rejectattr('stat.exists')
+           | map(attribute='item') | map('trim') | join('\n  ') }}
+  when:
+    - provision | length > 0
+    - lab_provision_stat.results | rejectattr('stat.exists') | list | length > 0
+
+- name: Choose the configuration playbooks
+  ansible.builtin.set_fact:
+    lab_provision_playbooks: >-
+      {{ lab_provision_stat.results | selectattr('stat.exists')
+         | map(attribute='stat.path') | list }}
+
+- name: Locate the test files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ lab_test_dir }}/default.yml"
+    - "{{ lab_test_dir }}/{{ lab_image.slug }}.yml"
+  loop_control:
+    label: "{{ item | basename }}"
+  register: lab_test_stat
+
+- name: Load the tests
+  ansible.builtin.set_fact:
+    lab_tests: "{{ lab_tests + (lookup('file', item) | from_yaml | default([], true)) }}"
+  loop: "{{ lab_test_stat.results | selectattr('stat.exists') | map(attribute='stat.path') | list }}"
+  loop_control:
+    label: "{{ item | basename }}"
+
+- name: Fail if there are no tests to run
+  ansible.builtin.fail:
+    msg: |
+      No tests found for {{ lab_image.name }}.
+
+      Expected tests/default.yml, and optionally tests/{{ lab_image.slug }}.yml.
+      Skip the whole verify phase with -e verify=false.
+  when: lab_tests | length == 0
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ lab_image.name }}:
+      {{ lab_provision_playbooks | length }} configuration playbook(s)
+      ({{ (lab_provision_playbooks | map('basename') | join(', ')) | default('none', true) or 'none' }}),
+      then {{ lab_tests | length }} test(s).
+
+# ─── The VM ──────────────────────────────────────────────────────────────────
+
+# The suffix is not decoration: two people verifying the same image at once
+# would otherwise collide on the instance name.
+- name: Name the verify VM
+  ansible.builtin.set_fact:
+    lab_vm: >-
+      verify-{{ lab_image.name }}-{{
+        lookup('password', '/dev/null chars=ascii_lowercase,digits length=4') }}
+
+- name: Assert the VM name is legal
+  ansible.builtin.assert:
+    that: lab_vm is match('^[a-z][-a-z0-9]{0,61}[a-z0-9]$')
+    fail_msg: >-
+      "{{ lab_vm }}" is not a legal GCP instance name. The image name is too
+      long to prefix; shorten the blueprint name.
+    quiet: true
+
+- name: Verify
+  block:
+    # No service account and no scopes: this VM needs to boot and answer SSH,
+    # nothing more. Metadata SSH does not go through the instance's identity,
+    # so dropping it costs nothing and means a VM left behind after a failure
+    # cannot reach the rest of the project.
+    - name: "Phase: create"
+      ansible.builtin.set_fact:
+        lab_phase: create
+
+    - name: Boot an instance from the image
+      ansible.builtin.command:
+        argv:
+          - gcloud
+          - compute
+          - instances
+          - create
+          - "{{ lab_vm }}"
+          - "--project={{ lab_target.project }}"
+          - "--zone={{ lab_target.zone }}"
+          - "--machine-type={{ lab_target.machine_type }}"
+          - "--image={{ lab_image.name }}"
+          - "--image-project={{ lab_target.project }}"
+          - "--network={{ lab_target.network }}"
+          - "--no-service-account"
+          - "--no-scopes"
+          - "--labels=managed-by=lab-image-builder,purpose=verify"
+          - "--format=value(name)"
+      register: lab_vm_create
+      changed_when: lab_vm_create.rc == 0
+
+    - name: Note that the VM exists
+      ansible.builtin.set_fact:
+        lab_vm_exists: true
+        lab_phase: boot
+
+    - name: Report the VM
+      ansible.builtin.debug:
+        msg: >-
+          {{ lab_vm }} booting in {{ lab_target.zone }}; waiting up to
+          {{ ((lab_boot_retries | int) * (lab_boot_delay | int) / 60) | round | int }}
+          minutes for SSH.
+
+    # Not just "is it up" — this is the first real assertion. Metadata SSH
+    # working proves something injected our key into an image that bakes in
+    # no users at all.
+    - name: Wait for SSH
+      ansible.builtin.command:
+        argv: "{{ lab_ssh_argv + ['--command=true'] + lab_ssh_opts }}"
+      register: lab_ssh_wait
+      until: lab_ssh_wait.rc == 0
+      retries: "{{ lab_boot_retries | int }}"
+      delay: "{{ lab_boot_delay | int }}"
+      changed_when: false
+
+    - name: "Phase: configure"
+      ansible.builtin.set_fact:
+        lab_phase: configure
+
+    - name: Build an inventory for the VM
+      ansible.builtin.include_tasks: inventory.yml
+      when: lab_provision_playbooks | length > 0
+
+    - name: Run the configuration playbooks
+      ansible.builtin.include_tasks: provision.yml
+      loop: "{{ lab_provision_playbooks }}"
+      loop_control:
+        loop_var: lab_playbook
+        label: "{{ lab_playbook | basename }}"
+
+    - name: "Phase: test"
+      ansible.builtin.set_fact:
+        lab_phase: test
+
+    - name: Run the tests
+      ansible.builtin.include_tasks: run_test.yml
+      loop: "{{ lab_tests }}"
+      loop_control:
+        loop_var: lab_test
+        label: "{{ lab_test.name }}"
+
+  rescue:
+    # A VM that never answered SSH, or a configuration playbook that blew up,
+    # is a result — not a crash. Record it like a failed test so the final
+    # report covers every image either way.
+    - name: Record the failure
+      ansible.builtin.set_fact:
+        lab_image_failures: "{{ (lab_image_failures | int) + 1 }}"
+        lab_test_results: "{{ lab_test_results + [_entry] }}"
+      vars:
+        _entry:
+          image: "{{ lab_image.name }}"
+          name: "{{ lab_phase }} phase failed — tests did not run"
+          ok: fail
+          command: ""
+          rc: "{{ ansible_failed_result.rc | default('-') }}"
+          stdout: "{{ ansible_failed_result.stdout | default('', true) | trim }}"
+          stderr: >-
+            {{ (ansible_failed_result.stderr | default('', true) | trim)
+               or (ansible_failed_result.msg | default('unknown', true)) }}
+
+  always:
+    - name: Remove the generated inventory
+      ansible.builtin.file:
+        path: "{{ lab_inventory }}"
+        state: absent
+      when: lab_inventory | length > 0
+
+    - name: Delete the VM
+      ansible.builtin.command: >-
+        gcloud compute instances delete {{ lab_vm }}
+        --project {{ lab_target.project }}
+        --zone {{ lab_target.zone }}
+        --quiet
+      register: lab_vm_delete
+      changed_when: lab_vm_delete.rc == 0
+      when:
+        - lab_vm_exists | bool
+        - (lab_image_failures | int) == 0 or not (lab_keep_on_failure | bool)
+
+    - name: Report the surviving VM
+      ansible.builtin.debug:
+        msg: |
+          {{ lab_image_failures }} failure(s) on {{ lab_image.name }}.
+          {{ lab_vm }} has been left running so you can look at the thing that
+          actually broke:
+
+            gcloud compute ssh {{ lab_vm }} \
+              --project {{ lab_target.project }} --zone {{ lab_target.zone }}
+
+          Delete it when you are done — it bills by the minute:
+
+            gcloud compute instances delete {{ lab_vm }} \
+              --project {{ lab_target.project }} --zone {{ lab_target.zone }} --quiet
+      when:
+        - lab_vm_exists | bool
+        - (lab_image_failures | int) > 0
+        - lab_keep_on_failure | bool

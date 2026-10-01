@@ -1,0 +1,44 @@
+---
+# Checks specific to blueprints/lab-base-rhel-10.2.yml. Appended to
+# tests/default.yml, which covers what every image has to satisfy.
+#
+# The filename must match the manifest in .build/, which is the blueprint
+# slug — including the dot in the point release.
+
+- name: the OS is RHEL 10.2
+  command: grep -o 'release [0-9.]*' /etc/redhat-release
+  expect_stdout: 'release 10\.2'
+
+# One command covers the whole package contract. rpm -q exits non-zero if
+# any one of these is missing and names it in stdout, so the report says
+# which, not just that something is wrong.
+- name: the blueprint's packages are installed
+  command: >-
+    rpm -q ansible-core buildah cloud-init cockpit cockpit-podman
+    cockpit-session-recording cockpit-storaged git httpd mod_ssl nmstate pcp
+    plocate podman stress-ng subscription-manager tmux tree tuned
+    vim-enhanced
+
+- name: cockpit answers on 9090
+  command: ss -ltn | grep :9090
+  expect_stdout: 'LISTEN'
+
+- name: pcp is collecting metrics
+  command: systemctl is-active pmcd pmlogger pmproxy
+  expect_stdout: '^active\nactive\nactive$'
+
+- name: podman is usable
+  command: sudo podman info
+  expect_stdout: 'graphDriverName'
+
+- name: ansible-core is on PATH
+  command: ansible --version
+  expect_stdout: 'core 2\.'
+
+# In the blueprint's packages but deliberately not in services.enabled.
+# `is-enabled` prints "disabled" and exits 1 for a unit that is installed
+# and switched off — which is what a lab image should ship.
+- name: httpd is installed but not started
+  command: systemctl is-enabled httpd
+  expect_rc: 1
+  expect_stdout: '^disabled$'

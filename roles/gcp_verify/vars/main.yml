@@ -1,0 +1,25 @@
+---
+# Built as an argv list rather than a shell string on purpose: a test's
+# `command` is arbitrary shell, full of quotes and pipes, and must reach the
+# remote shell byte for byte. Anything that goes through shlex will mangle it.
+#
+# These reference facts set at runtime (lab_vm, lab_target) and are templated
+# at use, not at load.
+lab_ssh_argv:
+  - gcloud
+  - compute
+  - ssh
+  - "{{ lab_vm }}"
+  - "--project={{ lab_target.project }}"
+  - "--zone={{ lab_target.zone }}"
+  - "--strict-host-key-checking=no"
+  - "--quiet"
+
+# Everything after `--` goes to ssh itself. BatchMode is what turns a hung
+# password prompt into an immediate failure.
+lab_ssh_opts:
+  - "--"
+  - "-o"
+  - "BatchMode=yes"
+  - "-o"
+  - "ConnectTimeout=15"

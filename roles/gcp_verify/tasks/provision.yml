@@ -1,0 +1,60 @@
+---
+# Run one configuration playbook against the VM.
+#
+# This shells out to `ansible-playbook` rather than importing the file,
+# because the point is that these stay *ordinary standalone playbooks*. You
+# can run the same file by hand against a real lab VM with nothing more than
+# an inventory — it is not a role this repo calls, and it carries no
+# knowledge of lab-image-builder. The cost is that its output arrives in one
+# block at the end instead of streaming.
+
+- name: "Configure: {{ lab_playbook | basename }}"
+  ansible.builtin.command:
+    argv:
+      - ansible-playbook
+      - "-i"
+      - "{{ lab_inventory }}"
+      - "{{ lab_playbook }}"
+      - "--extra-vars"
+      - "{{ _context | to_json }}"
+  vars:
+    _context:
+      lab_image_name: "{{ lab_image.name }}"
+      lab_image_family: "{{ lab_image.family }}"
+      lab_image_slug: "{{ lab_image.slug }}"
+      lab_image_distribution: "{{ lab_image.distribution }}"
+      lab_gcp_project: "{{ lab_target.project }}"
+      lab_gcp_zone: "{{ lab_target.zone }}"
+      lab_gcp_instance: "{{ lab_vm }}"
+      lab_target_name: "{{ target }}"
+  environment:
+    ANSIBLE_HOST_KEY_CHECKING: "false"
+    ANSIBLE_RETRY_FILES_ENABLED: "false"
+  register: lab_provision_run
+  changed_when: lab_provision_run.rc == 0
+  failed_when: false
+
+- name: "Recap: {{ lab_playbook | basename }}"
+  ansible.builtin.debug:
+    msg: "{{ lab_provision_run.stdout_lines[-12:] }}"
+  when: lab_provision_run.rc == 0
+
+# Fails into the rescue in main.yml, which records it as a failure for this
+# image and leaves the VM running. Tests do not run: smoke-testing a host
+# whose configuration half-applied tells you nothing you can act on.
+- name: Fail if the configuration playbook did not succeed
+  ansible.builtin.fail:
+    msg: |
+      {{ lab_playbook | basename }} exited {{ lab_provision_run.rc }} against
+      {{ lab_vm }}.
+
+      {{ lab_provision_run.stdout | trim }}
+      {{ lab_provision_run.stderr | default('') | trim }}
+
+      Re-run it by hand against the same VM:
+
+        ansible-playbook -i {{ lab_inventory }} {{ lab_playbook }}
+
+      (that inventory is deleted when this run ends — recreate it with
+       `gcloud compute ssh {{ lab_vm }} --zone {{ lab_target.zone }}`)
+  when: lab_provision_run.rc != 0

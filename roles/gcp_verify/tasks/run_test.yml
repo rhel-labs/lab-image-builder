@@ -1,0 +1,56 @@
+---
+# One test: run `command` over SSH, compare rc and stdout against what the
+# test says to expect. Called per entry in lab_tests, with lab_test set.
+#
+#   - name: cloud-init finished cleanly
+#     command: cloud-init status --wait
+#     expect_rc: 0                       # optional, default 0, `any` to skip
+#     expect_stdout: 'status: done'      # optional regex, searched not matched
+
+- name: Assert the test is well formed
+  ansible.builtin.assert:
+    that:
+      - lab_test.name | default('') | length > 0
+      - lab_test.command | default('') | length > 0
+    fail_msg: "Every test needs a name and a command. Got: {{ lab_test }}"
+    quiet: true
+
+- name: "Run: {{ lab_test.name }}"
+  ansible.builtin.command:
+    argv: "{{ lab_ssh_argv + ['--command=' ~ lab_test.command] + lab_ssh_opts }}"
+  register: lab_test_run
+  changed_when: false
+  failed_when: false
+
+# Two traps here, both of which make every test pass if you miss them.
+# Templating `_rc_ok` hands back the *string* "False", which is truthy, so
+# each part needs `| bool` before the `and`. And the result is stored as
+# "pass"/"fail" rather than a boolean for the same reason: a bool that has
+# been through a template is no longer reliably a bool.
+- name: "Record: {{ lab_test.name }}"
+  ansible.builtin.set_fact:
+    lab_test_results: "{{ lab_test_results + [_entry] }}"
+    lab_image_failures: "{{ (lab_image_failures | int) + ((_ok | bool) | ternary(0, 1)) }}"
+  vars:
+    _expect_rc: "{{ lab_test.expect_rc | default(0) }}"
+    _rc_ok: "{{ _expect_rc == 'any' or (lab_test_run.rc | int) == (_expect_rc | int) }}"
+    _out_ok: >-
+      {{ lab_test.expect_stdout is not defined
+         or (lab_test_run.stdout is search(lab_test.expect_stdout)) }}
+    _ok: "{{ (_rc_ok | bool) and (_out_ok | bool) }}"
+    _entry:
+      image: "{{ lab_image.name }}"
+      name: "{{ lab_test.name }}"
+      ok: "{{ (_ok | bool) | ternary('pass', 'fail') }}"
+      command: "{{ lab_test.command }}"
+      expect_rc: "{{ _expect_rc }}"
+      expect_stdout: "{{ lab_test.expect_stdout | default('') }}"
+      rc: "{{ lab_test_run.rc }}"
+      stdout: "{{ lab_test_run.stdout | default('') | trim }}"
+      stderr: "{{ lab_test_run.stderr | default('') | trim }}"
+
+- name: "Result: {{ lab_test.name }}"
+  ansible.builtin.debug:
+    msg: "{{ _r.ok | upper }}  {{ _r.name }}"
+  vars:
+    _r: "{{ lab_test_results | last }}"

@@ -1,0 +1,89 @@
+---
+# Copy images built by Part 1 out of Red Hat's GCP project into one of ours,
+# then prove each one boots, configures and behaves.
+#
+#   ansible-playbook import-image.yml
+#   ansible-playbook import-image.yml -e blueprint=lab-base-rhel-10.2
+#   ansible-playbook import-image.yml -e target=staging
+#   ansible-playbook import-image.yml -e verify=false
+#   ansible-playbook import-image.yml -e provision=provision/rhsm.yml
+#
+# Input is .build/*.json, written by build-image.yml. No rebuild is needed to
+# re-run this, and no Red Hat credentials are used — only your own gcloud.
+- name: Import lab images into GCP and verify them
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Resolve the target and find what there is to import
+      ansible.builtin.import_role:
+        name: gcp_target
+
+    # Every image is copied before any is verified, so one bad image does
+    # not strand the others in Red Hat's project with a limited shelf life.
+    - name: Import each image
+      ansible.builtin.include_role:
+        name: gcp_import
+      loop: "{{ lab_manifest_files.files | map(attribute='path') | sort }}"
+      loop_control:
+        loop_var: lab_manifest_path
+        label: "{{ lab_manifest_path | basename }}"
+
+    - name: Start a results table
+      ansible.builtin.set_fact:
+        lab_test_results: []
+
+    - name: Verify each image
+      ansible.builtin.include_role:
+        name: gcp_verify
+      loop: "{{ lab_imported }}"
+      loop_control:
+        loop_var: lab_image
+        label: "{{ lab_image.name }}"
+      when: verify | bool
+
+    - name: Report what was imported
+      ansible.builtin.debug:
+        msg: |
+          Imported into {{ lab_target.project }}:
+          {% for i in lab_imported %}
+            {{ i.name }}  (family {{ i.family }})
+          {% endfor %}
+
+          Lab VMs should ask for the family, not the name:
+            gcloud compute instances create my-lab-vm \
+              --project {{ lab_target.project }} --zone {{ lab_target.zone }} \
+              --image-family {{ lab_imported[0].family }} \
+              --image-project {{ lab_target.project }}
+
+    - name: Report the verification results
+      ansible.builtin.debug:
+        msg: |
+          {% for r in lab_test_results %}
+          {{ r.ok | upper }}  {{ r.image }}  {{ r.name }}
+          {% if r.ok != 'pass' %}
+                command  : {{ r.command | default('') }}
+                expected : rc {{ r.expect_rc | default('-') }}{{
+                  (r.expect_stdout | default('') | length > 0)
+                  | ternary(' + stdout matching /' ~ r.expect_stdout | default('') ~ '/', '') }}
+                got      : rc {{ r.rc }}
+                stdout   : {{ r.stdout | default('') | truncate(400) }}
+                stderr   : {{ r.stderr | default('') | truncate(400) }}
+          {% endif %}
+          {% endfor %}
+          {{ lab_test_results | selectattr('ok', 'eq', 'pass') | list | length }} passed,
+          {{ lab_test_results | rejectattr('ok', 'eq', 'pass') | list | length }} failed,
+          across {{ lab_imported | length }} image(s).
+      when: verify | bool
+
+    # Last, so the table above is always printed. The images are already in
+    # the project either way — a failed check does not un-import anything,
+    # it tells you not to point a lab at the family yet.
+    - name: Fail if anything did not pass
+      ansible.builtin.fail:
+        msg: >-
+          {{ lab_test_results | rejectattr('ok', 'eq', 'pass') | list | length }}
+          check(s) failed. The images are imported but not vouched for.
+      when:
+        - verify | bool
+        - lab_test_results | rejectattr('ok', 'eq', 'pass') | list | length > 0

@@ -1,0 +1,138 @@
+---
+# Copy one composed image out of Red Hat's GCP project into ours.
+# Called once per manifest with lab_manifest_path set.
+
+- name: Load the build manifest
+  ansible.builtin.set_fact:
+    lab_manifest: "{{ lookup('file', lab_manifest_path) | from_json }}"
+
+- name: Assert the manifest is usable
+  ansible.builtin.assert:
+    that:
+      - lab_manifest.rh_project_id | default('') | length > 0
+      - lab_manifest.rh_image_name | default('') | length > 0
+      - lab_manifest.blueprint_slug | default('') | length > 0
+      - lab_manifest.composed_at | default('') | length > 0
+    fail_msg: >-
+      {{ lab_manifest_path | basename }} is missing fields Part 2 needs.
+      Delete it and re-run build-image.yml.
+    quiet: true
+
+# GCP resource names are [a-z]([-a-z0-9]*[a-z0-9])?, max 63 — no dots, which
+# every RHEL point release has. lab-base-rhel-10.2 -> lab-base-rhel-10-2.
+- name: Derive the image family
+  ansible.builtin.set_fact:
+    lab_image_family: >-
+      {{ lab_manifest.blueprint_slug | lower
+         | regex_replace('[^a-z0-9]+', '-')
+         | regex_replace('(^-+|-+$)', '') }}
+
+# The family is the stable handle a lab VM asks for; the name is dated, so a
+# rebuild never collides with what it replaces and you can roll back by name.
+- name: Derive the image name
+  ansible.builtin.set_fact:
+    lab_image_name: "{{ lab_image_family }}-{{ _digits[0:8] }}-{{ _digits[8:12] }}"
+  vars:
+    _digits: "{{ lab_manifest.composed_at | regex_replace('[^0-9]', '') }}"
+
+- name: Assert the derived name is a legal GCP image name
+  ansible.builtin.assert:
+    that:
+      - lab_image_name is match('^[a-z][-a-z0-9]{0,61}[a-z0-9]$')
+    fail_msg: >-
+      Blueprint slug "{{ lab_manifest.blueprint_slug }}" produces
+      "{{ lab_image_name }}", which GCP will not accept as an image name
+      (must match ^[a-z][-a-z0-9]*[a-z0-9]$, max 63 chars). Rename the
+      blueprint.
+    quiet: true
+
+# The image lives in Red Hat's project on borrowed time — it is a build
+# artifact, not storage. If it has aged out, say so here rather than letting
+# gcloud's not-found read as a permissions problem.
+- name: Confirm the source image is still there and still shared with us
+  ansible.builtin.command: >-
+    gcloud compute images describe {{ lab_manifest.rh_image_name }}
+    --project {{ lab_manifest.rh_project_id }}
+    --format=value(status)
+  register: lab_source_image
+  changed_when: false
+  failed_when: false
+
+- name: Fail if the source image is gone
+  ansible.builtin.fail:
+    msg: |
+      Cannot read {{ lab_manifest.rh_image_name }}
+      in {{ lab_manifest.rh_project_id }} as {{ lab_gcloud_identity }}.
+
+      {{ lab_source_image.stderr | default('') | trim }}
+
+      Either the image has aged out of Red Hat's project — it is a build
+      artifact, not storage — or it was never shared with this account.
+      Either way the fix is to rebuild:
+
+        ansible-playbook build-image.yml -e blueprint={{ lab_manifest.blueprint_slug }}
+  when: lab_source_image.rc | default(1) | int != 0
+
+- name: Assert the source image is READY
+  ansible.builtin.assert:
+    that: lab_source_image.stdout | trim == 'READY'
+    fail_msg: >-
+      {{ lab_manifest.rh_image_name }} is
+      "{{ lab_source_image.stdout | trim }}", not READY. Nothing to copy yet.
+    quiet: true
+
+- name: Look for an existing import
+  ansible.builtin.command: >-
+    gcloud compute images describe {{ lab_image_name }}
+    --project {{ lab_target.project }}
+    --format=value(name)
+  register: lab_existing_image
+  changed_when: false
+  failed_when: false
+
+# No force flag needed, and deliberately so. The name carries the compose
+# timestamp, so the same compose always resolves to the same name and a new
+# compose always gets a new one. "Already there" therefore means "already
+# imported, byte for byte" — re-running is for the smoke tests, not the copy.
+- name: Import the image
+  ansible.builtin.command:
+    argv:
+      - gcloud
+      - compute
+      - images
+      - create
+      - "{{ lab_image_name }}"
+      - "--project={{ lab_target.project }}"
+      - "--source-image={{ lab_manifest.rh_image_name }}"
+      - "--source-image-project={{ lab_manifest.rh_project_id }}"
+      - "--family={{ lab_image_family }}"
+      - "--description={{ lab_manifest.blueprint_name }} ({{ lab_manifest.distribution }},
+          {{ lab_manifest.architecture }}) composed {{ lab_manifest.composed_at }},
+          compose {{ lab_manifest.compose_id }}"
+      - "--labels=managed-by=lab-image-builder,blueprint={{ lab_image_family }},distribution={{ _distro }},compose-id={{ lab_manifest.compose_id }}"
+      - "--format=value(name)"
+  vars:
+    _distro: "{{ lab_manifest.distribution | lower | regex_replace('[^a-z0-9_-]+', '-') }}"
+  register: lab_image_create
+  when: lab_existing_image.rc | default(1) | int != 0
+  changed_when: lab_image_create.rc == 0
+
+- name: Report the import
+  ansible.builtin.debug:
+    msg: >-
+      {{ (lab_existing_image.rc | default(1) | int == 0)
+         | ternary('Already imported', 'Imported') }}
+      {{ lab_image_name }} (family {{ lab_image_family }})
+      into {{ lab_target.project }}
+
+# Collected across the loop so the smoke phase is a separate pass: every
+# image gets copied even if an earlier one fails its tests.
+- name: Record the imported image
+  ansible.builtin.set_fact:
+    lab_imported: "{{ lab_imported | default([]) + [_entry] }}"
+  vars:
+    _entry:
+      name: "{{ lab_image_name }}"
+      family: "{{ lab_image_family }}"
+      slug: "{{ lab_manifest.blueprint_slug }}"
+      distribution: "{{ lab_manifest.distribution }}"
