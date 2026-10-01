@@ -129,12 +129,51 @@ Overwriting a blueprint someone edited in the web console is the one
 genuinely destructive thing this repo can do, so it never happens silently.
 `build-image.yml` refuses to push when either is true:
 
-- the console's version is ahead of what `.remote-state.json` last recorded, or
-- a blueprint of that name exists in the console but this repo has never
-  pulled it, so the two cannot be compared at all.
+- **the console is ahead** — its `version` is greater than the one
+  `.remote-state.json` last recorded, so someone edited it in the web UI
+  since this repo last pulled
+  (`roles/rh_blueprint_push/tasks/main.yml:59`), or
+- **the console copy was never pulled** — a blueprint of that name exists up
+  there but state has no entry for it, so there is no way to tell whether the
+  local file is a newer version of it or an unrelated blueprint that happens
+  to share a name (`:37`).
 
-Both failures name the versions involved and give you the two ways out:
-`pull-blueprints.yml` to take theirs, or `-e force_push=true` to take yours.
+Both failures name the versions and timestamps involved and give you the two
+ways out: `pull-blueprints.yml -e blueprint=<slug>` to take theirs, or
+`-e force_push=true` to take yours.
+
+### `force_push`
+
+Defaults to `false` in `group_vars/all/main.yml`. Set it per run:
+
+```sh
+ansible-playbook build-image.yml -e blueprint=lab-base-rhel-10.2 -e force_push=true
+```
+
+**It switches off the two guards above and does nothing else.** Each guard is
+a `fail` task carrying `not (force_push | bool)` as its last condition, so the
+flag decides whether the playbook stops — not what gets sent. The PUT body is
+byte-identical either way.
+
+What it means in practice is **"discard the console copy, mine wins."** The
+PUT overwrites whatever is up there and the console edit is gone: Image
+Builder keeps a version *counter*, not version history, so there is no undo.
+That is why it is a per-run flag and not a setting.
+
+It is narrower than the name suggests. It does **not** bypass:
+
+- blueprint validation in `validate.yml` (missing file, bad distribution,
+  unknown image type),
+- the lint report, or
+- anything in the compose.
+
+A failing build does not become a passing one because you forced the push.
+
+**You do not need it for ordinary work.** Pushing repeatedly from this repo
+bumps the console version *and* records it in the same `block`/`always` unit,
+so the two stay in step and neither guard fires. Reach for it when you have
+deliberately decided the local file is authoritative — adopting a blueprint
+that predates this repo, or stamping over console-side experimentation.
 
 ## Notes from building this
 
