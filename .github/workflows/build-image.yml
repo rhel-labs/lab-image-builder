@@ -211,6 +211,10 @@ jobs:
         with:
           name: build-manifest-${{ matrix.blueprint }}
           path: .build/*.json
+          # .build is a dotted directory and upload-artifact skips hidden
+          # paths by default, so without this the glob silently matches
+          # nothing and the step fails on if-no-files-found.
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
 

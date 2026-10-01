@@ -255,8 +255,12 @@ gh run download <run-id> -n build-manifest-lab-base-rhel-10.2 -D .build
 ansible-playbook import-image.yml
 ```
 
-**The bot commit.** Every run that changes `blueprints/.remote-state.json`
-commits it back to `main` as `github-actions[bot]`. This is not bookkeeping —
+**The bot commit.** `rh_blueprint_push` does not compare the local blueprint
+against the console copy before writing — it PUTs either way — so **every run
+bumps the console version, changed or not.** That is true of a laptop run too;
+CI just does it more often. Each run therefore commits
+`blueprints/.remote-state.json` back to `main` as `github-actions[bot]`, and
+the repo accumulates one such commit per build. This is not bookkeeping —
 it is what keeps [the drift guard](#the-drift-guard) from wedging the repo. CI
 bumps the version on the server; if that is never recorded here, the next run
 reads CI's own push as somebody's console edit and refuses to go. The step is
