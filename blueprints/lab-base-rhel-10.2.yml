@@ -30,6 +30,7 @@ customizations:
   - cockpit-ws
   - cockpit-ws-selinux
   - git-core
+  - pcp
   - plocate
   - podman
   - python3-psycopg2
@@ -47,6 +48,9 @@ customizations:
     - cloud-init-local.service
     - cloud-init.service
     - cockpit.socket
+    - pmcd.service
+    - pmlogger.service
+    - pmproxy.service
     - sshd
   timezone:
     timezone: UTC
