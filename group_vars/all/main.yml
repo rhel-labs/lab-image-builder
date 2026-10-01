@@ -140,8 +140,8 @@ lab_export_format: qcow2
 lab_export_prefix: ""
 
 # Export runs a Cloud Build job that boots a temporary VM and converts the
-# disk. It takes 10-25 minutes for a 20 GB image and gcloud's own ceiling is
-# 2h; it is by far the slowest thing in this repo.
+# disk — measured at 4 minutes for the 20 GB RHEL 10.2 image. This ceiling is
+# for the pathological case: a much bigger disk, or a zone short on capacity.
 lab_export_timeout: 2h
 
 # Exporting over an object that already exists requires saying so. The object

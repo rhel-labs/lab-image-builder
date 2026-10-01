@@ -77,9 +77,9 @@
           across {{ lab_imported | length }} image(s).
       when: verify | bool
 
-    # Only images that passed. Export runs a Cloud Build job for 10-25
-    # minutes and produces an artifact other people will pick up and use —
-    # publishing one this repo just failed is worse than not publishing.
+    # Only images that passed. An export is an artifact other people pick up
+    # and use, and publishing one this repo just failed its own checks on is
+    # worse than publishing nothing. -e verify=false exports anyway.
     - name: Export each image that passed
       ansible.builtin.include_role:
         name: gcp_export
