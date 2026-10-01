@@ -1,0 +1,4 @@
+# Build manifests — regenerable, and they name images with a limited lifetime.
+.build/
+
+*.retry

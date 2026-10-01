@@ -1,0 +1,44 @@
+# Pulled from console.redhat.com by lab-images. Edit freely.
+#
+#   ansible-playbook pull-blueprints.yml                      # refresh from console
+#   ansible-playbook build-image.yml -e blueprint=<this file> # push + compose
+#
+# name, description, distribution and customizations are what the API's
+# blueprint write body accepts, and are the whole of what gets pushed.
+# The GCP delivery target lives in group_vars/all/main.yml, not here.
+#
+# Lab images carry no `users:` (access is GCP metadata SSH) and no
+# `subscription:` (nothing baked in). build-image.yml warns if either
+# appears — a comment here would not survive the next pull.
+customizations:
+  firewall:
+    ports:
+    - 53:udp
+    - 53:tcp
+    - 67:udp
+    - 69:udp
+    - 80:tcp
+    - 443:tcp
+    - 5647:tcp
+    - 8000:tcp
+    - 9090:tcp
+    - 8140:tcp
+  locale:
+    languages:
+    - en_US.UTF-8
+  packages:
+  - bash-completion
+  - vim-enhanced
+  - tmux
+  - git-all
+  timezone:
+    timezone: America/Vancouver
+  users:
+  - groups:
+    - wheel
+    hasPassword: true
+    name: myee
+    ssh_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBsX4TprlqhZI5OC6/jpLhviAYG45n1WZd7XY18nbuF
+description: Satellite AWS and GCP image
+distribution: rhel-9
+name: rhel-9-x86_64-satellite

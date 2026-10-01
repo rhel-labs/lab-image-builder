@@ -1,0 +1,7 @@
+---
+# Everything here runs against the Red Hat API from this machine. There are no
+# managed nodes.
+all:
+  hosts:
+    localhost:
+      ansible_connection: local

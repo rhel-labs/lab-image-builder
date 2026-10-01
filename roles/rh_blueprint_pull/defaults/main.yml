@@ -1,0 +1,24 @@
+---
+# Server-side fields that must not land in the local file:
+#   id, lint         - server state, not definition
+#   image_requests   - the delivery target, injected at push time from
+#                      group_vars/all/main.yml so a pulled blueprint never
+#                      carries someone else's upload destination into the repo
+lab_pull_strip_keys:
+  - id
+  - lint
+  - image_requests
+
+lab_blueprint_header: |
+  # Pulled from console.redhat.com by lab-images. Edit freely.
+  #
+  #   ansible-playbook pull-blueprints.yml                      # refresh from console
+  #   ansible-playbook build-image.yml -e blueprint=<this file> # push + compose
+  #
+  # name, description, distribution and customizations are what the API's
+  # blueprint write body accepts, and are the whole of what gets pushed.
+  # The GCP delivery target lives in group_vars/all/main.yml, not here.
+  #
+  # Lab images carry no `users:` (access is GCP metadata SSH) and no
+  # `subscription:` (nothing baked in). build-image.yml warns if either
+  # appears — a comment here would not survive the next pull.

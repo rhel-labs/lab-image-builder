@@ -1,0 +1,68 @@
+---
+# ─── Credentials ─────────────────────────────────────────────────────────────
+# Deliberately outside the repo so they can never be committed. Mode 0600.
+#
+#   RH_CLIENT_ID=...
+#   RH_CLIENT_SECRET=...
+#
+# The service account must belong to a User Access group that grants Image
+# Builder access. Without one it authenticates fine and then 403s on every
+# call, which reads like a malformed request rather than a permissions gap.
+rh_credentials_file: "{{ lookup('env', 'HOME') }}/.config/redhat/lab-images.env"
+
+# ─── Endpoints ───────────────────────────────────────────────────────────────
+rh_sso_token_url: "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+rh_image_builder_api: "https://console.redhat.com/api/image-builder/v1"
+
+# ─── Repo paths ──────────────────────────────────────────────────────────────
+lab_blueprint_dir: "{{ playbook_dir }}/blueprints"
+lab_state_file: "{{ lab_blueprint_dir }}/.remote-state.json"
+lab_build_dir: "{{ playbook_dir }}/.build"
+
+# ─── Build defaults ──────────────────────────────────────────────────────────
+# Which blueprint to act on. Required by build-image.yml, optional for
+# pull-blueprints.yml (empty = all). Defined here rather than in a role so
+# that it is always defined: assert/fail messages are templated even when
+# the assertion passes, so an undefined var in a message is a hard error.
+blueprint: ""
+
+# Override per run: -e lab_architecture=aarch64
+lab_architecture: x86_64
+lab_image_type: gcp
+
+# Where Image Builder shares the finished image. Image Builder always writes
+# into Red Hat's own GCP project and grants access to the principals named
+# here — there is no way to make it write into ours, which is why the import
+# is Part 2 and not a flag.
+#
+# This must name the principal Part 2 runs as. The two parts are coupled at
+# exactly this one field; move the import to CI and this value changes too.
+lab_share_with_accounts:
+  - "user:myee@redhat.com"
+
+# Injected into every blueprint at push time. Kept here, once, rather than in
+# each blueprint file: what the image *is* belongs in the blueprint and is
+# worth diffing; where it gets *delivered* is environmental and identical
+# across all of them. It also means a blueprint pulled from the console never
+# carries someone else's upload target into this repo.
+lab_image_request:
+  architecture: "{{ lab_architecture }}"
+  image_type: "{{ lab_image_type }}"
+  upload_request:
+    type: "{{ lab_image_type }}"
+    options:
+      share_with_accounts: "{{ lab_share_with_accounts }}"
+
+# ─── Compose polling ─────────────────────────────────────────────────────────
+# The access token lives 900s and a GCP compose routinely outlives it. Polling
+# is therefore split into cycles: each cycle re-authenticates, then polls for
+# well under the token lifetime.
+#   36 x 15s = 9 min per cycle, 7 cycles = ~63 min ceiling.
+lab_poll_retries_per_cycle: 36
+lab_poll_delay: 15
+lab_poll_cycles: 7
+
+# ─── Safety ──────────────────────────────────────────────────────────────────
+# Overwriting a blueprint someone edited in the web console is the one
+# genuinely destructive thing this repo can do. It requires -e force_push=true.
+force_push: false

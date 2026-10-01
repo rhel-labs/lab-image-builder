@@ -1,0 +1,87 @@
+---
+- name: Check for service account credentials
+  ansible.builtin.stat:
+    path: "{{ rh_credentials_file }}"
+  register: rh_credentials_stat
+
+- name: Explain how to supply credentials
+  ansible.builtin.fail:
+    msg: |
+      No Red Hat service account credentials at {{ rh_credentials_file }}
+
+      Create a service account at
+        https://console.redhat.com/iam/service-accounts
+      add it to a User Access group that grants Image Builder access, then:
+
+        mkdir -p ~/.config/redhat
+        touch ~/.config/redhat/lab-images.env
+        chmod 600 ~/.config/redhat/lab-images.env
+        $EDITOR ~/.config/redhat/lab-images.env
+
+      with:
+
+        RH_CLIENT_ID=...
+        RH_CLIENT_SECRET=...
+
+      Type them into the editor. Not into a shell command, which lands in
+      your history, and not into a chat window.
+  when: not rh_credentials_stat.stat.exists
+
+- name: Warn if the credentials file is readable by others
+  ansible.builtin.debug:
+    msg: >-
+      {{ rh_credentials_file }} is mode
+      {{ rh_credentials_stat.stat.mode }}; expected 0600.
+      Fix with: chmod 600 {{ rh_credentials_file }}
+  when: rh_credentials_stat.stat.mode is not match('0[46]00')
+
+- name: Read service account credentials
+  ansible.builtin.slurp:
+    src: "{{ rh_credentials_file }}"
+  register: rh_credentials_raw
+  no_log: true
+
+- name: Parse service account credentials
+  ansible.builtin.set_fact:
+    rh_credentials: >-
+      {{ dict(rh_credentials_raw.content | b64decode
+              | regex_findall('(?m)^\s*(RH_CLIENT_ID|RH_CLIENT_SECRET)\s*=\s*(.*?)\s*$')) }}
+  no_log: true
+
+- name: Assert both credentials are present
+  ansible.builtin.assert:
+    that:
+      - rh_credentials.RH_CLIENT_ID | default('') | length > 0
+      - rh_credentials.RH_CLIENT_SECRET | default('') | length > 0
+    fail_msg: >-
+      {{ rh_credentials_file }} must define both RH_CLIENT_ID and
+      RH_CLIENT_SECRET as KEY=value lines.
+    quiet: true
+
+- name: Request an access token from Red Hat SSO
+  ansible.builtin.uri:
+    url: "{{ rh_sso_token_url }}"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      grant_type: client_credentials
+      client_id: "{{ rh_credentials.RH_CLIENT_ID }}"
+      client_secret: "{{ rh_credentials.RH_CLIENT_SECRET }}"
+    status_code: 200
+  register: rh_token_response
+  no_log: true
+
+- name: Store the access token
+  ansible.builtin.set_fact:
+    rh_auth_header:
+      Authorization: "Bearer {{ rh_token_response.json.access_token }}"
+    rh_token_expires_in: "{{ rh_token_response.json.expires_in }}"
+  no_log: true
+
+# Length and lifetime only. Never the token.
+- name: Report the token
+  ansible.builtin.debug:
+    msg: >-
+      Authenticated: token is
+      {{ rh_token_response.json.access_token | length }} chars,
+      valid {{ rh_token_expires_in }}s.

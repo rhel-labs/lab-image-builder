@@ -1,0 +1,7 @@
+---
+# The compose poll loop re-invokes this role once per cycle to stay ahead of
+# the 900s token expiry, so it must be allowed to run more than once.
+allow_duplicates: true
+
+galaxy_info:
+  description: Exchange a Red Hat service account for a console.redhat.com access token.

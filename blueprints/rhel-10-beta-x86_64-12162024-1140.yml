@@ -1,0 +1,49 @@
+# Pulled from console.redhat.com by lab-images. Edit freely.
+#
+#   ansible-playbook pull-blueprints.yml                      # refresh from console
+#   ansible-playbook build-image.yml -e blueprint=<this file> # push + compose
+#
+# name, description, distribution and customizations are what the API's
+# blueprint write body accepts, and are the whole of what gets pushed.
+# The GCP delivery target lives in group_vars/all/main.yml, not here.
+#
+# Lab images carry no `users:` (access is GCP metadata SSH) and no
+# `subscription:` (nothing baked in). build-image.yml warns if either
+# appears — a comment here would not survive the next pull.
+customizations:
+  files:
+  - data: W1VuaXRdCkRlc2NyaXB0aW9uPUN1c3RvbSBmaXJzdCBib290IHNjcmlwdApDb25kaXRpb25GaWxlSXNFeGVjdXRhYmxlPS91c3IvbG9jYWwvc2Jpbi9jdXN0b20tZmlyc3QtYm9vdApDb25kaXRpb25QYXRoRXhpc3RzPSEvdmFyL2xvY2FsLy5jdXN0b20tZmlyc3QtYm9vdC1kb25lCldhbnRzPW5ldHdvcmstb25saW5lLnRhcmdldApBZnRlcj1uZXR3b3JrLW9ubGluZS50YXJnZXQKQWZ0ZXI9b3NidWlsZC1maXJzdC1ib290LnNlcnZpY2UKCltTZXJ2aWNlXQpUeXBlPW9uZXNob3QKRXhlY1N0YXJ0PS91c3IvbG9jYWwvc2Jpbi9jdXN0b20tZmlyc3QtYm9vdApFeGVjU3RhcnRQb3N0PS91c3IvYmluL3RvdWNoIC92YXIvbG9jYWwvLmN1c3RvbS1maXJzdC1ib290LWRvbmUKUmVtYWluQWZ0ZXJFeGl0PXllcwoKW0luc3RhbGxdCldhbnRlZEJ5PWJhc2ljLnRhcmdldApXYW50ZWRCeT1tdWx0aS11c2VyLnRhcmdldApXYW50ZWRCeT1ncmFwaGljYWwudGFyZ2V0Cg==
+    data_encoding: base64
+    ensure_parents: true
+    path: /etc/systemd/system/custom-first-boot.service
+  - data: IyEvYmluL2Jhc2gKdXNlcmFkZCByaGVsCnVzZXJtb2QgLWFHIHdoZWVsIHJoZWwKZWNobyByZWRoYXQgfCBwYXNzd2QgLS1zdGRpbiByaGVs
+    data_encoding: base64
+    ensure_parents: true
+    mode: '0774'
+    path: /usr/local/sbin/custom-first-boot
+  packages:
+  - cockpit
+  - cockpit-files
+  - cockpit-podman
+  - cockpit-packagekit
+  - cockpit-composer
+  - cockpit-bridge
+  - cockpit-pcp
+  - cockpit-session-recording
+  - cockpit-storaged
+  - cockpit-system
+  - subscription-manager-cockpit
+  - rhel-system-roles
+  services:
+    enabled:
+    - custom-first-boot
+  subscription:
+    activation-key: lab
+    base-url: https://cdn.redhat.com/
+    insights: true
+    organization: 15765319
+    rhc: false
+    server-url: subscription.rhsm.redhat.com
+description: ''
+distribution: rhel-10-beta
+name: rhel-10-beta-x86_64-12162024-1140

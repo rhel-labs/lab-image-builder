@@ -1,0 +1,27 @@
+---
+# Push a local blueprint to console.redhat.com and compose a GCP image.
+#
+#   ansible-playbook build-image.yml -e blueprint=lab-base-rhel-10-2
+#   ansible-playbook build-image.yml -e blueprint=lab-base-rhel-10-2 -e distribution=rhel-9.8
+#   ansible-playbook build-image.yml -e blueprint=... -e force_push=true
+#
+# The finished image lands in Red Hat's GCP project, shared with the accounts
+# in group_vars/all/main.yml, and is described in .build/<blueprint>.json.
+# Part 2 (import-image.yml) copies it into ours.
+- name: Build a lab image with Red Hat hosted Image Builder
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Authenticate
+      ansible.builtin.import_role:
+        name: rh_auth
+
+    # Validates the selection and the distribution before anything is created.
+    - name: Push the blueprint
+      ansible.builtin.import_role:
+        name: rh_blueprint_push
+
+    - name: Compose the image
+      ansible.builtin.import_role:
+        name: rh_compose

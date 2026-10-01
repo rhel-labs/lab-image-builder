@@ -1,0 +1,25 @@
+# Pulled from console.redhat.com by lab-images. Edit freely.
+#
+#   ansible-playbook pull-blueprints.yml                      # refresh from console
+#   ansible-playbook build-image.yml -e blueprint=<this file> # push + compose
+#
+# name, description, distribution and customizations are what the API's
+# blueprint write body accepts, and are the whole of what gets pushed.
+# The GCP delivery target lives in group_vars/all/main.yml, not here.
+#
+# Lab images carry no `users:` (access is GCP metadata SSH) and no
+# `subscription:` (nothing baked in). build-image.yml warns if either
+# appears — a comment here would not survive the next pull.
+customizations:
+  filesystem:
+  - min_size: 53687091200
+    mountpoint: /
+  packages:
+  - bash-completion
+  - vim-enhanced
+  - git
+  - nmap-ncat
+  - wget
+description: ''
+distribution: rhel-89
+name: Satellite

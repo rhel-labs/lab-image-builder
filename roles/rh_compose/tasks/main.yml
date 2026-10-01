@@ -1,0 +1,150 @@
+---
+- name: Ensure the build directory exists
+  ansible.builtin.file:
+    path: "{{ lab_build_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Start the compose
+  ansible.builtin.uri:
+    url: "{{ rh_image_builder_api }}/blueprints/{{ lab_blueprint_id }}/compose"
+    method: POST
+    body_format: json
+    body:
+      image_types: ["{{ lab_image_type }}"]
+    headers: "{{ rh_auth_header }}"
+    status_code: 201
+  register: lab_compose_started
+  failed_when: false
+
+# Creating and editing blueprints needs no RBAC, but composing resolves Red
+# Hat repositories through the content-sources service, which does. The gap
+# therefore stays invisible until the first compose.
+- name: Explain a compose permission failure
+  ansible.builtin.fail:
+    msg: |
+      Image Builder refused the compose with 403:
+
+        {{ lab_compose_started.json.errors | default([])
+           | map(attribute='detail') | join('; ') }}
+
+      The blueprint pushed fine — blueprint CRUD does not check RBAC. Compose
+      does, because it has to resolve Red Hat repositories through the
+      content-sources service.
+
+      Fix it at https://console.redhat.com/iam/user-access/groups : put this
+      service account in a group whose roles include "Repositories viewer"
+      and "Content Template viewer" alongside an Image Builder role.
+
+      Check what it currently has:
+        GET https://console.redhat.com/api/rbac/v1/access/?application=content-sources
+
+      Then re-run. "{{ lab_blueprint_name }}" is already in the console, so
+      the next run updates it rather than creating a duplicate.
+  when: lab_compose_started.status | int == 403
+
+- name: Fail on any other compose error
+  ansible.builtin.fail:
+    msg: >-
+      POST /blueprints/{{ lab_blueprint_id }}/compose returned
+      {{ lab_compose_started.status }}:
+      {{ lab_compose_started.json | default(lab_compose_started.content | default(''), true) }}
+  when: lab_compose_started.status | int != 201
+
+# 201 returns an ARRAY of ComposeResponse — one entry per requested image
+# type, not a single object. We request one type, so [0].
+- name: Record the compose id
+  ansible.builtin.set_fact:
+    lab_compose_id: "{{ lab_compose_started.json[0].id }}"
+    lab_compose_status: pending
+
+- name: Report the compose
+  ansible.builtin.debug:
+    msg: >-
+      Compose {{ lab_compose_id }} started for "{{ lab_blueprint_name }}".
+      Watching for up to
+      {{ ((lab_poll_cycles | int) * (lab_poll_retries_per_cycle | int)
+          * (lab_poll_delay | int) / 60) | round | int }} minutes.
+      Progress: https://console.redhat.com/insights/image-builder
+
+# The access token lives 900s and a GCP compose routinely runs longer, so a
+# single until-loop would outlive its own token and start 401ing mid-build.
+# Each cycle re-authenticates first, then polls for well under that.
+- name: Poll until the compose finishes
+  ansible.builtin.include_tasks: poll_cycle.yml
+  loop: "{{ range(1, (lab_poll_cycles | int) + 1) | list }}"
+  loop_control:
+    loop_var: lab_poll_cycle
+    label: "cycle {{ lab_poll_cycle }}/{{ lab_poll_cycles }}"
+  when: lab_compose_status not in ['success', 'failure']
+
+- name: Fail if the compose never finished
+  ansible.builtin.fail:
+    msg: |
+      Compose {{ lab_compose_id }} was still "{{ lab_compose_status }}" after
+      ~{{ ((lab_poll_cycles | int) * (lab_poll_retries_per_cycle | int)
+           * (lab_poll_delay | int) / 60) | round | int }} minutes.
+
+      Nothing has been lost — the compose is still running at Red Hat. Check
+      https://console.redhat.com/insights/image-builder, or raise
+      lab_poll_cycles in group_vars/all/main.yml and re-run.
+  when: lab_compose_status not in ['success', 'failure']
+
+- name: Fail on a failed compose
+  ansible.builtin.fail:
+    msg: |
+      Compose {{ lab_compose_id }} failed.
+
+        reason:  {{ _err.reason | default('none reported') }}
+        details: {{ _err.details | default('none') }}
+  vars:
+    _err: "{{ lab_compose_result.image_status.error | default({}, true) }}"
+  when: lab_compose_status == 'failure'
+
+- name: Assert the upload landed
+  ansible.builtin.assert:
+    that:
+      - lab_compose_result.image_status.upload_status is defined
+      - lab_compose_result.image_status.upload_status.status == 'success'
+      - lab_compose_result.image_status.upload_status.options.image_name is defined
+    fail_msg: |
+      Compose {{ lab_compose_id }} reported success but carries no usable GCP
+      upload status. Part 2 would have nothing to import.
+      upload_status: {{ lab_compose_result.image_status.upload_status | default('absent') }}
+    quiet: true
+
+# The handoff to Part 2. A file on disk rather than facts passed between
+# plays, so the import can be re-run after a failure — or run days later —
+# without paying for another compose.
+- name: Write the build manifest
+  ansible.builtin.copy:
+    content: "{{ _manifest | to_nice_json(sort_keys=True) }}\n"
+    dest: "{{ lab_build_dir }}/{{ lab_blueprint_slug }}.json"
+    mode: "0644"
+  vars:
+    _upload: "{{ lab_compose_result.image_status.upload_status.options }}"
+    _manifest:
+      blueprint_name: "{{ lab_blueprint_name }}"
+      blueprint_slug: "{{ lab_blueprint_slug }}"
+      blueprint_id: "{{ lab_blueprint_id }}"
+      compose_id: "{{ lab_compose_id }}"
+      distribution: "{{ lab_distribution }}"
+      architecture: "{{ lab_architecture }}"
+      image_type: "{{ lab_image_type }}"
+      rh_project_id: "{{ _upload.project_id }}"
+      rh_image_name: "{{ _upload.image_name }}"
+      shared_with: "{{ lab_share_with_accounts }}"
+      composed_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+- name: Report the finished image
+  ansible.builtin.debug:
+    msg: |
+      Image ready.
+        project : {{ lab_compose_result.image_status.upload_status.options.project_id }}
+        image   : {{ lab_compose_result.image_status.upload_status.options.image_name }}
+        shared  : {{ lab_share_with_accounts | join(', ') }}
+        manifest: .build/{{ lab_blueprint_slug }}.json
+
+      It lives in Red Hat's GCP project, not ours. Confirm the share landed:
+        gcloud compute images describe {{ lab_compose_result.image_status.upload_status.options.image_name }} \
+          --project {{ lab_compose_result.image_status.upload_status.options.project_id }}

@@ -1,0 +1,160 @@
+---
+- name: Ensure the blueprint directory exists
+  ansible.builtin.file:
+    path: "{{ lab_blueprint_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Check for existing remote state
+  ansible.builtin.stat:
+    path: "{{ lab_state_file }}"
+  register: lab_state_stat
+
+# A filtered pull must not wipe the entries for blueprints it did not touch.
+- name: Load existing remote state
+  ansible.builtin.set_fact:
+    lab_remote_state: >-
+      {{ (lookup('file', lab_state_file) | from_json)
+         if lab_state_stat.stat.exists else {} }}
+
+- name: List blueprints
+  ansible.builtin.uri:
+    url: "{{ rh_image_builder_api }}/blueprints?limit=100&offset=0"
+    headers: "{{ rh_auth_header }}"
+    status_code: 200
+  register: lab_bp_page_first
+
+- name: List remaining blueprint pages
+  ansible.builtin.uri:
+    url: "{{ rh_image_builder_api }}/blueprints?limit=100&offset={{ item }}"
+    headers: "{{ rh_auth_header }}"
+    status_code: 200
+  loop: "{{ range(100, lab_bp_page_first.json.meta.count | int, 100) | list }}"
+  loop_control:
+    label: "offset {{ item }}"
+  register: lab_bp_pages_rest
+
+- name: Collect every blueprint
+  ansible.builtin.set_fact:
+    lab_bp_all: >-
+      {{ lab_bp_page_first.json.data
+         + (lab_bp_pages_rest.results | default([], true)
+            | map(attribute='json.data') | flatten) }}
+    lab_bp_slugged: []
+
+# Blueprint names are free text up to 100 chars — "RHEL 9" and
+# "centos-9 x86_64 aws 22 August 2024" are both real. The slug is the
+# filename and the CLI handle; the name field inside the file stays
+# authoritative for talking to the API.
+- name: Derive a filename slug for each blueprint
+  ansible.builtin.set_fact:
+    lab_bp_slugged: "{{ lab_bp_slugged + [item | combine({'slug': _slug})] }}"
+  loop: "{{ lab_bp_all }}"
+  loop_control:
+    label: "{{ item.name }}"
+  vars:
+    _slug: >-
+      {{ item.name | lower
+         | regex_replace('[^a-z0-9._-]+', '-')
+         | regex_replace('^[-._]+', '')
+         | regex_replace('[-._]+$', '') }}
+
+- name: Assert no two blueprints slug to the same filename
+  ansible.builtin.assert:
+    that: _slugs | length == _slugs | unique | length
+    fail_msg: |
+      Two or more blueprints would be written to the same file:
+      {% for s in _slugs | unique %}{% if _slugs.count(s) > 1 %}
+        {{ s }}.yml  <-  {{ lab_bp_slugged | selectattr('slug', 'equalto', s)
+                            | map(attribute='name') | join('  |  ') }}
+      {% endif %}{% endfor %}
+      Rename one of them in the console, then pull again.
+    quiet: true
+  vars:
+    _slugs: "{{ lab_bp_slugged | map(attribute='slug') | list }}"
+
+- name: Select which blueprints to pull
+  ansible.builtin.set_fact:
+    lab_bp_selected: >-
+      {{ lab_bp_slugged
+         if (blueprint | default('', true) | length == 0)
+         else (lab_bp_slugged | selectattr('slug', 'equalto', blueprint) | list) }}
+
+- name: Assert the requested blueprint exists in the console
+  ansible.builtin.assert:
+    that: lab_bp_selected | length > 0
+    fail_msg: |
+      No blueprint in the console slugs to "{{ blueprint }}".
+      Available: {{ lab_bp_slugged | map(attribute='slug') | sort | join(', ') }}
+    quiet: true
+
+# One call per blueprint. GET /blueprints/{id} returns name, description,
+# distribution, customizations, image_requests and lint — a superset of the
+# writable fields plus the lint report.
+#
+# GET /blueprints/{id}/export looks like the natural choice and is not: it
+# resolves content-sources data, so it 403s unless the service account also
+# holds "Repositories viewer" / "Content Template viewer", and it omits lint.
+- name: Fetch each blueprint definition
+  ansible.builtin.uri:
+    url: "{{ rh_image_builder_api }}/blueprints/{{ item.id }}"
+    headers: "{{ rh_auth_header }}"
+    status_code: 200
+  loop: "{{ lab_bp_selected }}"
+  loop_control:
+    label: "{{ item.slug }}"
+  register: lab_bp_details
+
+- name: Write blueprint files
+  ansible.builtin.copy:
+    content: "{{ lab_blueprint_header }}{{ _definition | to_nice_yaml(indent=2, width=200) }}"
+    dest: "{{ lab_blueprint_dir }}/{{ item.item.slug }}.yml"
+    mode: "0644"
+  loop: "{{ lab_bp_details.results }}"
+  loop_control:
+    label: "{{ item.item.slug }}.yml"
+  vars:
+    _definition: >-
+      {{ item.json | dict2items
+         | rejectattr('key', 'in', lab_pull_strip_keys)
+         | items2dict }}
+
+- name: Report lint findings
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item.slug }}:
+      {{ item.json.lint.errors | default([]) | length }} lint error(s),
+      {{ item.json.lint.warnings | default([]) | length }} warning(s)
+      - {{ (item.json.lint.errors | default([]))
+           + (item.json.lint.warnings | default([])) }}
+  loop: "{{ lab_bp_details.results }}"
+  loop_control:
+    label: "{{ item.item.slug }}"
+  when: >-
+    (item.json.lint.errors | default([]) | length > 0)
+    or (item.json.lint.warnings | default([]) | length > 0)
+
+- name: Record remote state
+  ansible.builtin.set_fact:
+    lab_remote_state: >-
+      {{ lab_remote_state | combine({item.slug: {
+           'name': item.name,
+           'id': item.id,
+           'version': item.version,
+           'last_modified_at': item.last_modified_at }}) }}
+  loop: "{{ lab_bp_selected }}"
+  loop_control:
+    label: "{{ item.slug }}"
+
+- name: Write remote state
+  ansible.builtin.copy:
+    content: "{{ lab_remote_state | to_nice_json(sort_keys=True) }}\n"
+    dest: "{{ lab_state_file }}"
+    mode: "0644"
+
+- name: Summarise
+  ansible.builtin.debug:
+    msg: >-
+      Pulled {{ lab_bp_selected | length }} blueprint(s) into
+      {{ lab_blueprint_dir }}:
+      {{ lab_bp_selected | map(attribute='slug') | sort | join(', ') }}

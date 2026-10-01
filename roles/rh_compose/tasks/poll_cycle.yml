@@ -1,0 +1,36 @@
+---
+# One poll cycle: a fresh token, then polling for less than its lifetime.
+
+- name: Refresh the access token
+  ansible.builtin.include_role:
+    name: rh_auth
+  when: lab_poll_cycle | int > 1
+
+- name: Poll the compose
+  ansible.builtin.uri:
+    url: "{{ rh_image_builder_api }}/composes/{{ lab_compose_id }}"
+    headers: "{{ rh_auth_header }}"
+    status_code: 200
+  register: lab_compose_poll
+  until: >-
+    lab_compose_poll.json.image_status.status | default('')
+    in ['success', 'failure']
+  retries: "{{ lab_poll_retries_per_cycle | int }}"
+  delay: "{{ lab_poll_delay | int }}"
+  # Exhausting this cycle's budget is the normal case for a long compose, not
+  # an error — the next cycle picks up with a fresh token. A genuinely stuck
+  # compose is caught after the last cycle, by name.
+  failed_when: false
+
+- name: Record the latest status
+  ansible.builtin.set_fact:
+    lab_compose_status: "{{ lab_compose_poll.json.image_status.status | default('unknown') }}"
+    lab_compose_result: "{{ lab_compose_poll.json | default({}, true) }}"
+
+- name: Report cycle progress
+  ansible.builtin.debug:
+    msg: >-
+      cycle {{ lab_poll_cycle }}/{{ lab_poll_cycles }}:
+      compose is "{{ lab_compose_status }}"
+      {{ '(' ~ lab_compose_result.image_status.upload_status.status ~ ' upload)'
+         if lab_compose_result.image_status.upload_status is defined else '' }}

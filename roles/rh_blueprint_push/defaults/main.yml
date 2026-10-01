@@ -1,0 +1,12 @@
+---
+# `blueprint` itself is defined in group_vars/all/main.yml.
+lab_blueprint_file: "{{ lab_blueprint_dir }}/{{ blueprint }}.yml"
+
+# The only fields the API's blueprint write body accepts, minus
+# image_requests (injected) and metadata (server provenance).
+lab_push_keys:
+  - name
+  - description
+  - distribution
+  - customizations
+  - bootc

@@ -1,0 +1,100 @@
+---
+- name: Find the available blueprint files
+  ansible.builtin.find:
+    paths: "{{ lab_blueprint_dir }}"
+    patterns: "*.yml"
+  register: lab_bp_files
+
+- name: Assert a blueprint was selected
+  ansible.builtin.assert:
+    that: blueprint | default('', true) | length > 0
+    fail_msg: |
+      No blueprint selected.
+
+        ansible-playbook build-image.yml -e blueprint=<name>
+
+      Available: {{ _available | join(', ') if _available | length > 0
+                    else '(none — run pull-blueprints.yml first)' }}
+    quiet: true
+  vars:
+    _available: "{{ lab_bp_files.files | map(attribute='path') | map('basename')
+                    | map('regex_replace', '\\.yml$', '') | sort }}"
+
+- name: Assert the selected blueprint file exists
+  ansible.builtin.assert:
+    that: lab_blueprint_file in (lab_bp_files.files | map(attribute='path') | list)
+    fail_msg: |
+      No such blueprint: "{{ blueprint }}"
+      Looked for {{ lab_blueprint_file }}
+
+      Available: {{ _available | join(', ') if _available | length > 0
+                    else '(none — run pull-blueprints.yml first)' }}
+    quiet: true
+  vars:
+    _available: "{{ lab_bp_files.files | map(attribute='path') | map('basename')
+                    | map('regex_replace', '\\.yml$', '') | sort }}"
+
+- name: Load the blueprint definition
+  ansible.builtin.set_fact:
+    lab_blueprint_def: "{{ lookup('file', lab_blueprint_file) | from_yaml }}"
+
+- name: Assert the blueprint file is well formed
+  ansible.builtin.assert:
+    that:
+      - lab_blueprint_def is mapping
+      - lab_blueprint_def.name | default('', true) | length > 0
+      - lab_blueprint_def.distribution | default('', true) | length > 0
+      - lab_blueprint_def.customizations is defined
+    fail_msg: |
+      {{ lab_blueprint_file }} must define name, distribution and
+      customizations. customizations is required by the API even when empty.
+    quiet: true
+
+- name: Determine the effective distribution
+  ansible.builtin.set_fact:
+    lab_distribution: "{{ distribution | default(lab_blueprint_def.distribution, true) }}"
+
+# An override builds the same definition on another OS under a derived name,
+# so testing rhel-9.8 never clobbers the rhel-10.2 blueprint it came from.
+- name: Determine the target blueprint name
+  ansible.builtin.set_fact:
+    lab_blueprint_name: >-
+      {{ lab_blueprint_def.name if lab_distribution == lab_blueprint_def.distribution
+         else lab_blueprint_def.name ~ '-' ~ lab_distribution }}
+    lab_blueprint_slug: >-
+      {{ blueprint if lab_distribution == lab_blueprint_def.distribution
+         else blueprint ~ '-' ~ lab_distribution }}
+
+- name: List the distributions this account may build
+  ansible.builtin.uri:
+    url: "{{ rh_image_builder_api }}/distributions"
+    headers: "{{ rh_auth_header }}"
+    status_code: 200
+  register: lab_distros
+
+# Turns a typo into a named failure here rather than an opaque 400 later.
+- name: Assert the distribution is available
+  ansible.builtin.assert:
+    that: lab_distribution in _valid
+    fail_msg: |
+      "{{ lab_distribution }}" is not a distribution this account can build.
+      Available: {{ _valid | sort | join(', ') }}
+    quiet: true
+  vars:
+    _valid: "{{ lab_distros.json | map(attribute='name') | list }}"
+
+- name: Assert the image type is valid
+  ansible.builtin.assert:
+    that: lab_image_type in _valid
+    fail_msg: 'lab_image_type "{{ lab_image_type }}" must be one of: {{ _valid | join(", ") }}'
+    quiet: true
+  vars:
+    _valid: [aws, azure, gcp, oci, vsphere, vsphere-ova, guest-image, image-installer, wsl]
+
+- name: Warn about customizations that do not belong in a lab image
+  ansible.builtin.debug:
+    msg: >-
+      {{ blueprint }} sets customizations.{{ item }} — lab images use GCP
+      metadata SSH and bake in no subscription. Remove it unless deliberate.
+  loop: [users, subscription]
+  when: lab_blueprint_def.customizations[item] is defined

@@ -1,0 +1,160 @@
+---
+- name: Include validation
+  ansible.builtin.include_tasks: validate.yml
+
+- name: Check for existing remote state
+  ansible.builtin.stat:
+    path: "{{ lab_state_file }}"
+  register: lab_state_stat
+
+- name: Load existing remote state
+  ansible.builtin.set_fact:
+    lab_remote_state: >-
+      {{ (lookup('file', lab_state_file) | from_json)
+         if lab_state_stat.stat.exists else {} }}
+
+- name: Look up the blueprint on the console
+  ansible.builtin.uri:
+    url: "{{ rh_image_builder_api }}/blueprints?name={{ lab_blueprint_name | urlencode }}&limit=100"
+    headers: "{{ rh_auth_header }}"
+    status_code: 200
+  register: lab_bp_lookup
+
+# ?name= is an exact-match filter, but matching again here means a change in
+# that behaviour can't silently attach us to the wrong blueprint.
+- name: Identify the existing blueprint
+  ansible.builtin.set_fact:
+    lab_bp_remote: >-
+      {{ (lab_bp_lookup.json.data
+          | selectattr('name', 'equalto', lab_blueprint_name)
+          | list | first) | default({}, true) }}
+    lab_bp_known: "{{ lab_remote_state[lab_blueprint_slug] | default({}, true) }}"
+
+# ─── Drift guards ────────────────────────────────────────────────────────────
+# Overwriting an edit someone made in the web console is the one genuinely
+# destructive thing this repo can do, so it never happens by accident.
+
+- name: Refuse to adopt a console blueprint this repo has never pulled
+  ansible.builtin.fail:
+    msg: |
+      A blueprint named "{{ lab_blueprint_name }}" already exists in the
+      console (id {{ lab_bp_remote.id }}, version {{ lab_bp_remote.version }}),
+      but {{ lab_state_file | basename }} has no record of it. This repo has
+      never pulled it, so there is no way to tell whether your local file is
+      a newer version of it or an unrelated blueprint that happens to share
+      a name.
+
+      Pushing now would overwrite whatever is up there.
+
+        ansible-playbook pull-blueprints.yml -e blueprint={{ lab_blueprint_slug }}
+            adopt the console copy (overwrites your local file)
+
+        ansible-playbook build-image.yml -e blueprint={{ blueprint }} -e force_push=true
+            overwrite the console copy with yours
+  when:
+    - lab_bp_remote.id is defined
+    - lab_bp_known.version is not defined
+    - not (force_push | bool)
+
+- name: Refuse to clobber a console-side edit
+  ansible.builtin.fail:
+    msg: |
+      "{{ lab_blueprint_name }}" has changed in the web console since this
+      repo last pulled it.
+
+        console version    {{ lab_bp_remote.version }}  ({{ lab_bp_remote.last_modified_at }})
+        last pulled here   {{ lab_bp_known.version }}  ({{ lab_bp_known.last_modified_at }})
+
+      Pushing now would discard that edit.
+
+        ansible-playbook pull-blueprints.yml -e blueprint={{ lab_blueprint_slug }}
+            take theirs (discards your local edits)
+
+        ansible-playbook build-image.yml -e blueprint={{ blueprint }} -e force_push=true
+            take yours (discards the console edit)
+  when:
+    - lab_bp_remote.id is defined
+    - lab_bp_known.version is defined
+    - (lab_bp_remote.version | int) > (lab_bp_known.version | int)
+    - not (force_push | bool)
+
+# ─── Upsert ──────────────────────────────────────────────────────────────────
+
+- name: Assemble the blueprint request body
+  ansible.builtin.set_fact:
+    lab_bp_body: >-
+      {{ (lab_blueprint_def | dict2items
+          | selectattr('key', 'in', lab_push_keys) | items2dict)
+         | combine({'name': lab_blueprint_name,
+                    'distribution': lab_distribution,
+                    'image_requests': [lab_image_request]}) }}
+
+# The upsert and the state reconcile are one unit. If a write lands but the
+# version is never recorded, the next run's drift guard reads our own write
+# as somebody else's edit and the repo wedges until someone forces past it —
+# so the reconcile runs in `always`, on the failure path too. It re-reads the
+# server's actual version, which is correct whether the write landed or not.
+- name: Upsert the blueprint
+  block:
+    - name: Update the existing blueprint
+      ansible.builtin.uri:
+        url: "{{ rh_image_builder_api }}/blueprints/{{ lab_bp_remote.id }}"
+        method: PUT
+        body_format: json
+        body: "{{ lab_bp_body }}"
+        headers: "{{ rh_auth_header }}"
+        # The spec documents 200; the live API returns 201. Accept both.
+        status_code: [200, 201]
+      register: lab_bp_updated
+      when: lab_bp_remote.id is defined
+
+    - name: Create the blueprint
+      ansible.builtin.uri:
+        url: "{{ rh_image_builder_api }}/blueprints"
+        method: POST
+        body_format: json
+        body: "{{ lab_bp_body }}"
+        headers: "{{ rh_auth_header }}"
+        status_code: 201
+      register: lab_bp_created
+      when: lab_bp_remote.id is not defined
+
+    - name: Record the blueprint id
+      ansible.builtin.set_fact:
+        lab_blueprint_id: >-
+          {{ lab_bp_remote.id | default(lab_bp_created.json.id, true) }}
+
+  always:
+    - name: Re-read the blueprint version after pushing
+      ansible.builtin.uri:
+        url: "{{ rh_image_builder_api }}/blueprints?name={{ lab_blueprint_name | urlencode }}&limit=100"
+        headers: "{{ rh_auth_header }}"
+        status_code: 200
+      register: lab_bp_after
+      failed_when: false
+
+    - name: Reconcile remote state
+      ansible.builtin.copy:
+        content: "{{ _state | to_nice_json(sort_keys=True) }}\n"
+        dest: "{{ lab_state_file }}"
+        mode: "0644"
+      vars:
+        _found: >-
+          {{ lab_bp_after.json.data | default([], true)
+             | selectattr('name', 'equalto', lab_blueprint_name) | list }}
+        _current: "{{ _found | first }}"
+        _state: >-
+          {{ lab_remote_state | combine({lab_blueprint_slug: {
+               'name': _current.name,
+               'id': _current.id,
+               'version': _current.version,
+               'last_modified_at': _current.last_modified_at }}) }}
+      when: _found | length > 0
+
+- name: Report the push
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Updated' if lab_bp_remote.id is defined else 'Created' }}
+      blueprint "{{ lab_blueprint_name }}"
+      ({{ lab_distribution }}, {{ lab_architecture }})
+      id {{ lab_blueprint_id }}

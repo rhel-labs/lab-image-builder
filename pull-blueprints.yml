@@ -1,0 +1,20 @@
+---
+# Download blueprints from console.redhat.com into blueprints/.
+#
+#   ansible-playbook pull-blueprints.yml                       # all of them
+#   ansible-playbook pull-blueprints.yml -e blueprint=rhel-10-2-eus
+#
+# This overwrites local files. It is the "take theirs" direction; build-image
+# is the "take mine" direction. They are deliberately not symmetric.
+- name: Pull blueprints from the Hybrid Cloud Console
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Authenticate
+      ansible.builtin.import_role:
+        name: rh_auth
+
+    - name: Pull blueprints
+      ansible.builtin.import_role:
+        name: rh_blueprint_pull
