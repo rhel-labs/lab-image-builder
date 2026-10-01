@@ -6,7 +6,7 @@ console.redhat.com from blueprints kept in this repo.
 The work is split in two:
 
 | | Part 1 — build at Red Hat | Part 2 — import to GCP |
-|---|---|---|
+| --- | --- | --- |
 | Playbooks | `pull-blueprints.yml`, `build-image.yml` | `import-image.yml` *(not yet written)* |
 | Input | `blueprints/<name>.yml` | `.build/*.json` |
 | Output | image in **Red Hat's** GCP project, shared to us | image in `tmm-instruqt-11-26-2021` |
@@ -224,7 +224,7 @@ that predates this repo, or stamping over console-side experimentation.
 
 ## Layout
 
-```
+```sh
 ansible.cfg
 inventory.yml                     localhost, connection: local
 group_vars/all/main.yml           endpoints, delivery target, defaults
