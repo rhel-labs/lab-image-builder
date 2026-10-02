@@ -5,6 +5,12 @@
         "name": "centos-9 x86_64 aws 22 August 2024",
         "version": 1
     },
+    "lab-base-rhel-10.1": {
+        "id": "bf0be00f-66d5-4bd2-8256-b48e31500d4a",
+        "last_modified_at": "2026-10-02T00:21:30Z",
+        "name": "lab-base-rhel-10.1",
+        "version": 1
+    },
     "lab-base-rhel-10.2": {
         "id": "5c0d32c3-a75e-4372-86bf-e8c001128391",
         "last_modified_at": "2026-10-01T22:11:02Z",
