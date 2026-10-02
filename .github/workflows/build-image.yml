@@ -1,5 +1,8 @@
 ---
-# Compose a blueprint at Red Hat when it is committed.
+# Compose a blueprint at Red Hat when it is committed to the build-image
+# branch. Deliberately not main: a build mutates state (it bumps the console's
+# blueprint version and commits the new number back), so it runs on a branch
+# you push to on purpose rather than on everything that lands on main.
 #
 # This is Part 1 only. The finished image lands in Red Hat's GCP project shared
 # to whoever lab_share_with_accounts names, and the build manifest comes back as
@@ -9,7 +12,7 @@ name: Build image
 
 "on":
   push:
-    branches: [main]
+    branches: [build-image]
     paths:
       - 'blueprints/*.yml'
   workflow_dispatch:
@@ -149,6 +152,10 @@ jobs:
         if: ${{ always() && !inputs.dry_run }}
         env:
           BLUEPRINT: ${{ matrix.blueprint }}
+          # The branch that triggered this run, not main. Recording the
+          # version anywhere else would leave *this* branch stale and wedge
+          # its next build on the drift guard.
+          BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
@@ -171,7 +178,7 @@ jobs:
           git config user.email \
             '41898282+github-actions[bot]@users.noreply.github.com'
 
-          # Re-apply that key onto whatever main holds *now*, rather than
+          # Re-apply that key onto whatever $BRANCH holds *now*, rather than
           # rebasing our diff onto it. A build can hold this checkout for an
           # hour, and the next blueprint in the matrix — or a person — may
           # have recorded a different one meanwhile. The file is sorted JSON
@@ -179,7 +186,7 @@ jobs:
           # the merge git is worst at, and a conflict here wedges the repo.
           # jq -S --indent 4 reproduces Ansible's to_nice_json byte for byte.
           for attempt in 1 2 3; do
-            git fetch origin main
+            git fetch origin "$BRANCH"
             git reset --hard FETCH_HEAD   # .build/ is untracked and survives
 
             jq -S --indent 4 --arg k "$BLUEPRINT" --argjson v "$entry" \
@@ -187,13 +194,13 @@ jobs:
             mv "$RUNNER_TEMP/state.json" "$STATE"
 
             if git diff --quiet -- "$STATE"; then
-              echo "Already recorded on main."
+              echo "Already recorded on $BRANCH."
               exit 0
             fi
 
             git commit -m "Record $BLUEPRINT version from CI build" -- "$STATE"
-            if git push origin HEAD:main; then
-              echo "Recorded $BLUEPRINT $(jq -r .version <<<"$entry")." \
+            if git push origin "HEAD:$BRANCH"; then
+              echo "Recorded $BLUEPRINT $(jq -r .version <<<"$entry") on $BRANCH." \
                 >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi

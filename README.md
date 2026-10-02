@@ -139,8 +139,9 @@ Each of these is doing a specific job:
 - **The workflow never echoes.** `set -eu`, not `set -x`, and `printf`
   straight into the file. GitHub also masks known secret values if they show
   up in a log, but that is a backstop, not the plan.
-- **Forks cannot reach them.** The only triggers are `push` to `main`, which
-  needs write access, and `workflow_dispatch`. There is deliberately no
+- **Forks cannot reach them.** The only triggers are `push` to the
+  `build-image` branch, which needs write access, and `workflow_dispatch`.
+  There is deliberately no
   `pull_request_target` — that is the setting that would let a stranger's pull
   request run code with access to the secrets on a public repo.
 
@@ -299,20 +300,58 @@ that predates this repo, or stamping over console-side experimentation.
 
 ## Building from CI
 
-**In one sentence:** when you commit a blueprint, GitHub rents you a temporary
-Linux machine for a few minutes, installs Ansible on it, and has it run
-`ansible-playbook build-image.yml` — the same command you would type yourself.
+**In one sentence:** when you push a blueprint to the **`build-image`**
+branch, GitHub rents you a temporary Linux machine for a few minutes,
+installs Ansible on it, and has it run `ansible-playbook build-image.yml` —
+the same command you would type yourself.
 
 That is genuinely all `.github/workflows/build-image.yml` does. Everything
 else in it is bookkeeping around that one command. It runs Part 1 only; the
 import stays manual until you turn it on.
 
+### Why a branch and not main
+
+A build is not a read-only operation. It bumps the blueprint's version in the
+Red Hat console, and then commits the new number back into the repo. Wiring
+that to `main` means every merge that happens to touch a blueprint fires a
+twenty-minute build and writes a commit back at you, whether or not you
+wanted one right then.
+
+So the trigger is a branch you push to **on purpose**. `main` stays the
+branch of record; `build-image` is the one that means "build this now".
+
+```sh
+git switch build-image
+git merge main                      # pick up whatever else has landed
+$EDITOR blueprints/lab-base-rhel-10.2.yml
+git commit -am 'Add pcp-zeroconf'
+git push                            # ← this is what starts a build
+```
+
+**The consequence worth knowing.** CI records the new version on
+`build-image`, not on `main`, because recording it anywhere else would leave
+`build-image` stale and wedge its own next build. That means `main` is now
+behind: build from a `main` checkout on your laptop and
+[the drift guard](#the-drift-guard) will fire, correctly, because the console
+has moved on and `main` does not know it. The fix is not `force_push` — it is
+to merge:
+
+```sh
+git switch main
+git merge build-image               # brings the recorded version with it
+```
+
+Treat `build-image` as the branch that leads and `main` as the branch you
+merge back into, and the two never disagree for long.
+
 ### What actually happens
 
-You edit `blueprints/lab-base-rhel-10.2.yml` and push it to `main`.
+You edit `blueprints/lab-base-rhel-10.2.yml` and push it to **`build-image`**.
 
-1. **GitHub notices.** The workflow says "wake up when a push to `main`
-   changes a file matching `blueprints/*.yml`." Yours does, so a run starts.
+1. **GitHub notices.** The workflow says "wake up when a push to
+   `build-image` changes a file matching `blueprints/*.yml`." Yours does, so a
+   run starts. Pushing the same change to `main` does nothing — see
+   [Why a branch and not main](#why-a-branch-and-not-main).
 2. **A throwaway machine boots.** Blank — no Ansible, no credentials. It
    downloads a copy of the repo.
 3. **It installs what it needs.** Just `ansible-core`, which is quick, because
@@ -350,7 +389,8 @@ without writing that down, the *next* build sees console 8 against a recorded
 7, concludes someone edited it in the console — when that someone was CI — and
 refuses to run. The repo jams until a human forces past it.
 
-So the machine commits that one file back to `main` itself before it goes.
+So the machine commits that one file back to `build-image` itself before it
+goes — the branch that triggered the run, never `main`.
 Those are the `Record <slug> version from CI build` commits in the history.
 One per build, and they are what stops the repo jamming. Two details follow
 from that:
@@ -382,13 +422,20 @@ You do not have to commit anything:
 
 ```sh
 # build now
-gh workflow run build-image.yml -f blueprint=lab-base-rhel-10.2
+gh workflow run build-image.yml --ref build-image \
+  -f blueprint=lab-base-rhel-10.2
 
 # just check the credentials still work — ~30s, composes nothing
-gh workflow run build-image.yml -f blueprint=lab-base-rhel-10.2 -f dry_run=true
+gh workflow run build-image.yml --ref build-image \
+  -f blueprint=lab-base-rhel-10.2 -f dry_run=true
 
 gh run watch
 ```
+
+`--ref` matters. Without it a dispatch runs against the default branch, and
+the version would be recorded there instead — which is the one thing the
+branch split exists to avoid. The workflow records to whichever branch it ran
+on (`github.ref_name`), so point it at `build-image`.
 
 `dry_run` runs `pull-blueprints.yml` instead of composing and then throws the
 working tree away. It is the one to reach for when something looks broken and
@@ -665,9 +712,9 @@ The image is already imported and unaffected by any of that — re-run with
   keys put their changes within a hunk's context of each other and git may
   conflict on an edit that is not actually a conflict. A conflict there wedges
   the repo, which is the thing the write-back exists to prevent. The workflow
-  reads back the one key it is entitled to have changed, resets to current
-  `main`, and re-applies it with `jq -S --indent 4` — which reproduces
-  Ansible's `to_nice_json(sort_keys=True)` byte for byte.
+  reads back the one key it is entitled to have changed, resets to the
+  branch's current tip, and re-applies it with `jq -S --indent 4` — which
+  reproduces Ansible's `to_nice_json(sort_keys=True)` byte for byte.
 - **The access token expires after 900s and a GCP compose routinely runs
   longer.** A single poll loop would outlive its own token and start 401ing
   mid-build. Polling is split into cycles that re-authenticate first; see
@@ -739,7 +786,7 @@ inventory.yml                     localhost, connection: local
 group_vars/all/main.yml           endpoints, delivery target, targets, defaults
 docs/service-account.md           console-side RBAC setup
 .github/workflows/
-  build-image.yml                 compose on commit; import job present, off
+  build-image.yml                 runs on pushes to the build-image branch
 blueprints/
   lab-base-rhel-10.2.yml          edit these
   .remote-state.json              slug -> id + version (committed)
