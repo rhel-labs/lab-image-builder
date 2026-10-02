@@ -1,0 +1,68 @@
+# Pulled from console.redhat.com by lab-images. Edit freely.
+#
+#   ansible-playbook pull-blueprints.yml                      # refresh from console
+#   ansible-playbook build-image.yml -e blueprint=<this file> # push + compose
+#
+# name, description, distribution and customizations are what the API's
+# blueprint write body accepts, and are the whole of what gets pushed.
+# The GCP delivery target lives in group_vars/all/main.yml, not here.
+#
+# Lab images carry no `users:` (access is GCP metadata SSH) and no
+# `subscription:` (nothing baked in). build-image.yml warns if either
+# appears — a comment here would not survive the next pull.
+customizations:
+  packages:
+  - ansible-core
+  - bash-completion
+  - buildah
+  - ca-certificates
+  - cloud-init
+  - cockpit
+  - cockpit-bridge
+  - cockpit-doc
+  - cockpit-files
+  - cockpit-ostree
+  - cockpit-packagekit
+  - cockpit-podman
+  - cockpit-session-recording
+  - cockpit-storaged
+  - cockpit-system
+  - cockpit-ws
+  - cockpit-ws-selinux
+  - git
+  - httpd
+  - man-db
+  - mod_ssl
+  - nmap-ncat
+  - nmstate
+  - pcp
+  - plocate
+  - podman
+  - python3-psycopg2
+  - rsync
+  - sshpass
+  - stress-ng
+  - subscription-manager
+  - subscription-manager-cockpit
+  - tar
+  - tmux
+  - tree
+  - tuned
+  - vim-enhanced
+  - wget
+  services:
+    enabled:
+    - cloud-config.service
+    - cloud-final.service
+    - cloud-init-local.service
+    - cloud-init.service
+    - cockpit.socket
+    - pmcd.service
+    - pmlogger.service
+    - pmproxy.service
+    - sshd
+  timezone:
+    timezone: UTC
+description: RHEL 10.1 lab base with cloud-init, cockpit, podman and ansible-core
+distribution: rhel-10.1
+name: lab-base-rhel-10.1
