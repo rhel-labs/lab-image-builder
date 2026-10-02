@@ -74,6 +74,93 @@ GCE image.
 
 Part 1 needs no GCP credentials at all. Part 2 needs no Red Hat ones.
 
+## Credentials
+
+There are **two** Red Hat credentials in play, and conflating them is what
+makes this confusing.
+
+```text
+RH_CLIENT_ID + RH_CLIENT_SECRET      long-lived. A password for a robot
+         │                           account. Does not expire until you
+         │                           rotate it.
+         │
+         │   POST to sso.redhat.com
+         ▼
+     access token                    short-lived. Dies after 900 seconds.
+         │
+         │   Authorization: Bearer …
+         ▼
+  console.redhat.com/api/image-builder
+```
+
+The long-lived pair **never touches Image Builder.** It only ever goes to Red
+Hat's SSO server, which trades it for a token; the token is what is attached
+to every actual API call. Turning the first into the second is the entire job
+of `roles/rh_auth`. And because a GCP compose takes about twenty minutes while
+a token lives fifteen, `rh_auth` runs again every poll cycle for a fresh one —
+see `lab_poll_*` in `group_vars/all/main.yml`. It is not a once-per-build step.
+
+### Where the long-lived pair lives
+
+**On your laptop**, one file and nothing else:
+
+```text
+~/.config/redhat/lab-images.env      mode 0600, outside this repo
+```
+
+Outside the repo is the point: a file that is not in the working tree cannot
+be `git add`-ed by accident.
+
+**In CI**, the throwaway runner has no such file, so the workflow builds one:
+
+| Hop | What |
+| --- | --- |
+| GitHub's secret store | encrypted at rest; `RH_CLIENT_ID`, `RH_CLIENT_SECRET` |
+| → environment variables | only within the one step that needs them |
+| → the same path on disk | `printf` under `umask 077` |
+| → destroyed | the runner is wiped minutes later |
+
+Why recreate a file rather than teach the role to read the environment?
+Because `rh_auth` stats and slurps a *path*. Giving CI its own code path would
+mean two ways of loading credentials to keep correct; writing the file the
+role already expects means CI and your laptop run identical code.
+
+### What stops them leaking
+
+Each of these is doing a specific job:
+
+- **`no_log: true`** on every task in `rh_auth` that touches a value — the
+  slurp, the parse, the SSO request, and storing the token. This is the one
+  that matters most: without it, `ansible-playbook -vvv` prints your client
+  secret to the terminal, and in CI into a log the whole internet can read.
+- **Only length and lifetime are ever printed** — `token is 1143 chars, valid
+  900s`. Enough to debug with, useless to steal.
+- **A mode check.** `rh_auth` warns if the file is not `0600`.
+- **The workflow never echoes.** `set -eu`, not `set -x`, and `printf`
+  straight into the file. GitHub also masks known secret values if they show
+  up in a log, but that is a backstop, not the plan.
+- **Forks cannot reach them.** The only triggers are `push` to `main`, which
+  needs write access, and `workflow_dispatch`. There is deliberately no
+  `pull_request_target` — that is the setting that would let a stranger's pull
+  request run code with access to the secrets on a public repo.
+
+### Two things to be clear-eyed about
+
+**Anyone with write access to this repo can use these secrets.** Not read them
+from the UI — GitHub will not show them back to anyone, including you — but
+they could add a workflow step that sends them elsewhere. That is inherent to
+CI secrets everywhere, not specific to this setup. What it means in practice:
+*push access to this repo is equivalent to holding the Red Hat service
+account.* If that set of people is wider than the set you would hand the
+account to, narrow one or the other.
+
+**Rotation is a two-place job** now. Regenerate the service account and you
+must update both `~/.config/redhat/lab-images.env` and the two GitHub secrets,
+or CI starts failing with a 401 while your laptop keeps working.
+
+The blast radius is bounded, at least: this is an Image Builder service
+account scoped by a User Access group, not a Red Hat login.
+
 ## Usage
 
 ```sh
@@ -233,9 +320,8 @@ You edit `blueprints/lab-base-rhel-10.2.yml` and push it to `main`.
 4. **It writes your credentials to a file.** The playbook reads the Red Hat
    client id and secret from `~/.config/redhat/lab-images.env`. That file
    lives on your laptop and is deliberately not in the repo, so the workflow
-   recreates it on the throwaway machine, at mode `0600`, from two values
-   stored in GitHub's secret box. (`rh_auth` reads a *file* and has no
-   environment-variable fallback, which is why this step exists at all.)
+   recreates it on the throwaway machine from two values stored in GitHub's
+   secret box. [Credentials](#credentials) covers the whole chain.
 5. **It runs the build.** `ansible-playbook build-image.yml -e blueprint=…`.
    Red Hat composes the image. About twenty minutes, same as on your laptop.
 6. **The machine is destroyed**, credentials file and all. That is the point.
@@ -319,11 +405,9 @@ Two repository secrets, under *Settings → Secrets and variables → Actions*:
 | `RH_CLIENT_ID` | the service account's client id |
 | `RH_CLIENT_SECRET` | its secret |
 
-That is the whole setup.
-
-**Safety on a public repo.** The only triggers are `push` to `main`, which
-needs write access, and `workflow_dispatch`. There is no `pull_request_target`
-— a fork's pull request can never reach the secrets. Keep it that way.
+That is the whole setup. What happens to those two values on the runner, what
+keeps them out of the logs, and who can effectively use them once they are
+there: **[Credentials](#credentials)**.
 
 ### Turning the import on
 
