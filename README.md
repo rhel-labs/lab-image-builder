@@ -212,65 +212,114 @@ that predates this repo, or stamping over console-side experimentation.
 
 ## Building from CI
 
-`.github/workflows/build-image.yml` composes a blueprint when it is committed,
-so nobody has to remember to. It runs Part 1 only; the import stays manual
-until you turn it on.
+**In one sentence:** when you commit a blueprint, GitHub rents you a temporary
+Linux machine for a few minutes, installs Ansible on it, and has it run
+`ansible-playbook build-image.yml` — the same command you would type yourself.
 
-**Triggers.** A push to `main` that changes any `blueprints/*.yml`, and
-`workflow_dispatch` for a build on demand:
+That is genuinely all `.github/workflows/build-image.yml` does. Everything
+else in it is bookkeeping around that one command. It runs Part 1 only; the
+import stays manual until you turn it on.
 
-```sh
-gh workflow run build-image.yml -f blueprint=lab-base-rhel-10.2
-gh workflow run build-image.yml -f blueprint=lab-base-rhel-10.2 -f dry_run=true
-gh run watch
-```
+### What actually happens
 
-A commit touching several blueprints builds all of them, one at a time.
-Deleting a blueprint does not try to build it. `dry_run` runs
-`pull-blueprints.yml` instead of composing and then throws the working tree
-away — about thirty seconds to prove the secrets, the credentials file and
-`rh_auth` all work. Note what it does *not* prove: pull needs no
-content-sources permissions, so it can pass while `POST /compose` is still
-unauthorised.
+You edit `blueprints/lab-base-rhel-10.2.yml` and push it to `main`.
 
-**Setup.** Two repository secrets, under *Settings → Secrets and variables →
-Actions*:
+1. **GitHub notices.** The workflow says "wake up when a push to `main`
+   changes a file matching `blueprints/*.yml`." Yours does, so a run starts.
+2. **A throwaway machine boots.** Blank — no Ansible, no credentials. It
+   downloads a copy of the repo.
+3. **It installs what it needs.** Just `ansible-core`, which is quick, because
+   every role here is pure `ansible.builtin` — no collections, no SDKs.
+4. **It writes your credentials to a file.** The playbook reads the Red Hat
+   client id and secret from `~/.config/redhat/lab-images.env`. That file
+   lives on your laptop and is deliberately not in the repo, so the workflow
+   recreates it on the throwaway machine, at mode `0600`, from two values
+   stored in GitHub's secret box. (`rh_auth` reads a *file* and has no
+   environment-variable fallback, which is why this step exists at all.)
+5. **It runs the build.** `ansible-playbook build-image.yml -e blueprint=…`.
+   Red Hat composes the image. About twenty minutes, same as on your laptop.
+6. **The machine is destroyed**, credentials file and all. That is the point.
 
-| Name | Value |
-| --- | --- |
-| `RH_CLIENT_ID` | the service account's client id |
-| `RH_CLIENT_SECRET` | its secret |
+So before it dies, two things have to be rescued.
 
-The workflow writes them to `~/.config/redhat/lab-images.env` on the runner at
-mode `0600`, because `rh_auth` reads a file and has no environment-variable
-fallback. That is the only setup. The runner installs `ansible-core` and
-nothing else — every role here is pure `ansible.builtin`.
+### The two things it rescues
 
-**The manifest.** `.build/` is gitignored, so each successful build uploads its
-manifest as a workflow artifact named `build-manifest-<slug>`, kept 90 days.
-To run Part 2 against a CI build:
+**The manifest.** The build writes `.build/<slug>.json` — the handoff file
+Part 2 reads to know which image to import. `.build/` is gitignored, so it
+cannot be committed; instead each successful build attaches it to the run as
+an artifact named `build-manifest-<slug>`, kept 90 days:
 
 ```sh
 gh run download <run-id> -n build-manifest-lab-base-rhel-10.2 -D .build
 ansible-playbook import-image.yml
 ```
 
-**The bot commit.** `rh_blueprint_push` does not compare the local blueprint
-against the console copy before writing — it PUTs either way — so **every run
-bumps the console version, changed or not.** That is true of a laptop run too;
-CI just does it more often. Each run therefore commits
-`blueprints/.remote-state.json` back to `main` as `github-actions[bot]`, and
-the repo accumulates one such commit per build. This is not bookkeeping —
-it is what keeps [the drift guard](#the-drift-guard) from wedging the repo. CI
-bumps the version on the server; if that is never recorded here, the next run
-reads CI's own push as somebody's console edit and refuses to go. The step is
-`if: always()` for the same reason the reconcile is in Ansible's `always:`: a
-*failed* compose still bumped the version.
+**The version number**, which is the genuinely non-obvious one. This repo
+remembers the console's version in `blueprints/.remote-state.json`, and
+[the drift guard](#the-drift-guard) compares the two: console ahead of the
+file means somebody edited the blueprint in the web console, so stop.
 
-That commit does not retrigger the workflow, for two independent reasons —
-the path filter is `blueprints/*.yml` and the bot touches only
-`.remote-state.json`, and GitHub does not start runs from pushes made with
-`GITHUB_TOKEN`. No `[skip ci]` convention is needed.
+But a CI push bumps the console too. If the throwaway machine is destroyed
+without writing that down, the *next* build sees console 8 against a recorded
+7, concludes someone edited it in the console — when that someone was CI — and
+refuses to run. The repo jams until a human forces past it.
+
+So the machine commits that one file back to `main` itself before it goes.
+Those are the `Record <slug> version from CI build` commits in the history.
+One per build, and they are what stops the repo jamming. Two details follow
+from that:
+
+- The step is `if: always()`, not "on success". `rh_blueprint_push` reconciles
+  the state file inside an `always:` block, so even a *failed* compose has
+  already bumped the version and still needs recording.
+- You get one of these commits per build whether or not the blueprint changed.
+  `rh_blueprint_push` does not diff the local file against the console copy
+  before writing — it PUTs either way — so every run bumps the version. True
+  of a laptop run too; CI just does it more often.
+
+> **Doesn't that commit trigger another build, forever?** No, for two
+> independent reasons: the trigger watches `blueprints/*.yml` while the bot
+> touches only `.remote-state.json`, and GitHub does not start runs from
+> pushes made with `GITHUB_TOKEN`. No `[skip ci]` convention needed.
+
+### The three jobs
+
+| Job | What it does |
+| --- | --- |
+| `select` | Works out which blueprints the commit changed. Usually one; change three and it builds all three, one after another. Deleting one does not try to build it. |
+| `build` | Everything in the walkthrough above. |
+| `import` | Part 2. **Currently does nothing** — see below. |
+
+### Running it by hand
+
+You do not have to commit anything:
+
+```sh
+# build now
+gh workflow run build-image.yml -f blueprint=lab-base-rhel-10.2
+
+# just check the credentials still work — ~30s, composes nothing
+gh workflow run build-image.yml -f blueprint=lab-base-rhel-10.2 -f dry_run=true
+
+gh run watch
+```
+
+`dry_run` runs `pull-blueprints.yml` instead of composing and then throws the
+working tree away. It is the one to reach for when something looks broken and
+you want to know whether it is the credentials or the build. What it does
+*not* prove: pull needs no content-sources permissions, so it can pass while
+`POST /compose` is still unauthorised.
+
+### Setup
+
+Two repository secrets, under *Settings → Secrets and variables → Actions*:
+
+| Name | Value |
+| --- | --- |
+| `RH_CLIENT_ID` | the service account's client id |
+| `RH_CLIENT_SECRET` | its secret |
+
+That is the whole setup.
 
 **Safety on a public repo.** The only triggers are `push` to `main`, which
 needs write access, and `workflow_dispatch`. There is no `pull_request_target`
