@@ -35,10 +35,23 @@ lab_image_type: gcp
 # here — there is no way to make it write into ours, which is why the import
 # is Part 2 and not a flag.
 #
-# This must name the principal Part 2 runs as. The two parts are coupled at
-# exactly this one field; move the import to CI and this value changes too.
+# This must name *every* principal Part 2 might run as: your gcloud login for
+# a laptop run, the CI service account for a GitHub run. The two parts are
+# coupled at exactly this one field.
+#
+# Two things about editing this list:
+#
+#   1. Sharing happens at *compose* time. Adding a principal does not make
+#      images already built reachable by it — those were shared to whoever
+#      was named when they were composed. A new principal needs a rebuild.
+#   2. The account has to exist in GCP first. Image Builder turns this list
+#      into an IAM policy on the image, and IAM rejects a binding naming an
+#      account that is not there.
+#
+# The service account is the CI importer; see docs/ci-gcp-identity.md.
 lab_share_with_accounts:
   - "user:myee@redhat.com"
+  - "serviceAccount:lab-image-importer@tmm-instruqt-11-26-2021.iam.gserviceaccount.com"
 
 # Injected into every blueprint at push time. Kept here, once, rather than in
 # each blueprint file: what the image *is* belongs in the blueprint and is

@@ -39,11 +39,16 @@
   ansible.builtin.fail:
     msg: |
       gcloud is not on PATH. Part 2 drives the Google Cloud CLI directly —
-      no Ansible collection, no service account key, just your own gcloud
-      credentials.
+      no Ansible collection, no service account key.
+
+      On a laptop:
 
         brew install --cask google-cloud-sdk
         gcloud auth login
+
+      In CI, google-github-actions/setup-gcloud installs it. If this fires
+      inside a GitHub run then that step is missing, or it ran after this
+      playbook. See docs/ci-gcp-identity.md.
   when: lab_gcloud.rc | default(1) | int != 0
 
 - name: Find the active gcloud account
@@ -55,12 +60,20 @@
 - name: Fail if gcloud is not authenticated
   ansible.builtin.fail:
     msg: |
-      No active gcloud account. Run:
+      No active gcloud account.
+
+      On a laptop:
 
         gcloud auth login
 
-      Part 2 runs as you, not as a service account, because the image is
-      shared to a named principal — see share_with_accounts below.
+      In CI this means the Workload Identity Federation exchange produced no
+      usable credential. setup-gcloud runs `gcloud auth login --cred-file`
+      against the file the auth step wrote, so an empty account list means
+      that step failed or was skipped — read its log before this one.
+
+      Either way, whoever ends up active has to be named in
+      lab_share_with_accounts. That is who Image Builder shared the image
+      with, and the sharing happened at compose time.
   when: >-
     lab_gcloud_account.rc | default(1) | int != 0
     or (lab_gcloud_account.stdout | default('') | trim | length) == 0
@@ -69,21 +82,68 @@
   ansible.builtin.set_fact:
     lab_gcloud_identity: "{{ lab_gcloud_account.stdout | trim }}"
 
+# How this identity would be written in a share list. gcloud reports a human
+# as a plain email address and a service account as
+# name@project.iam.gserviceaccount.com; Image Builder prefixes the first
+# "user:" and the second "serviceAccount:". The prefix therefore has to be
+# derived, not assumed — hardcoding "user:" here made every CI run warn that
+# the image was not shared with the very account it was shared with.
+- name: Work out how this identity would be written in a share list
+  ansible.builtin.set_fact:
+    lab_gcloud_principal: >-
+      {{ (lab_gcloud_identity is match('^[^@/\s]+@[^@/\s]+$'))
+         | ternary(lab_gcloud_identity.endswith('.gserviceaccount.com')
+                   | ternary('serviceAccount:', 'user:') ~ lab_gcloud_identity,
+                   '') }}
+
+# Empty means the identity is not an email at all. The way that happens is
+# direct Workload Identity Federation, where gcloud reports
+# principal://iam.googleapis.com/... — there is no share-list spelling for
+# one of those, and guessing "user:" would have you paste something Image
+# Builder rejects straight into group_vars and break the next compose.
+- name: Fail if the identity cannot be written as a share principal
+  ansible.builtin.fail:
+    msg: |
+      gcloud is authenticated as {{ lab_gcloud_identity }}, which is not an
+      account address and cannot appear in lab_share_with_accounts.
+
+      In CI this means the auth step fell through to direct Workload Identity
+      Federation — almost always because the GCP_SERVICE_ACCOUNT repository
+      variable is unset or misspelled, so no impersonation happened. The
+      import cannot work this way: Image Builder shares to a named account,
+      and a federated principal does not have one.
+
+      See docs/ci-gcp-identity.md.
+  when: lab_gcloud_principal | length == 0
+
 # The one field Part 1 and Part 2 are coupled at. Image Builder shares the
 # image to the principals in lab_share_with_accounts; if the account running
 # the import is not among them, the source image simply will not exist as far
 # as gcloud is concerned, and the error says "not found" rather than
 # "not shared with you".
+#
+# Compared case-insensitively: GCP treats the local part of an account as
+# case-insensitive, and lowering both sides lowers both prefixes too, so
+# "serviceAccount:" still matches itself.
 - name: Warn if this identity is not one the image was shared with
   ansible.builtin.debug:
     msg: |
-      WARNING: gcloud is authenticated as {{ lab_gcloud_identity }}, which is
-      not in lab_share_with_accounts ({{ lab_share_with_accounts | join(', ') }}).
+      WARNING: gcloud is authenticated as {{ lab_gcloud_identity }}, which
+      would be written {{ lab_gcloud_principal }} — and that is not in
+      lab_share_with_accounts ({{ lab_share_with_accounts | join(', ') }}).
 
       If the share was to a group this is fine. Otherwise the import will fail
-      with a not-found on the source image, and the fix is in Part 1: change
-      lab_share_with_accounts in group_vars/all/main.yml and rebuild.
-  when: ('user:' ~ lab_gcloud_identity) not in lab_share_with_accounts
+      with a not-found on the source image, and the fix is in Part 1: add
+
+        - "{{ lab_gcloud_principal }}"
+
+      to lab_share_with_accounts in group_vars/all/main.yml and rebuild.
+      Sharing happens at compose time, so images already built stay
+      unreachable from this account.
+  when: >-
+    lab_gcloud_principal | length > 0
+    and lab_gcloud_principal | lower
+        not in (lab_share_with_accounts | map('lower') | list)
 
 - name: Check access to the target project
   ansible.builtin.command: >-

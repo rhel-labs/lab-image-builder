@@ -4,10 +4,12 @@
 # blueprint version and commits the new number back), so it runs on a branch
 # you push to on purpose rather than on everything that lands on main.
 #
-# This is Part 1 only. The finished image lands in Red Hat's GCP project shared
-# to whoever lab_share_with_accounts names, and the build manifest comes back as
-# a workflow artifact for import-image.yml to pick up. The `import` job at the
-# bottom is Part 2, present but switched off — see README, "Building from CI".
+# Two parts. Part 1 composes at Red Hat: the finished image lands in Red Hat's
+# own GCP project, shared to whoever lab_share_with_accounts names, and the
+# build manifest comes back as a workflow artifact. Part 2 — the `import` job
+# at the bottom — copies that image into our project. It runs automatically
+# once ENABLE_IMPORT is set, and does nothing at all until then.
+# See README, "Building from CI".
 name: Build image
 
 "on":
@@ -225,19 +227,29 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-  # ─── Part 2, wired but off ─────────────────────────────────────────────────
-  # Does nothing until the ENABLE_IMPORT repository variable is set to "true".
-  # Read "Turning the import on" in the README first — it needs GCP Workload
-  # Identity Federation, and lab_share_with_accounts has to name the CI service
-  # account *before* the image is composed, so switching it on does not make
-  # already-built images importable.
+  # ─── Part 2: import into GCP ───────────────────────────────────────────────
+  # Runs automatically after a successful build, in the same run, over the
+  # manifests that build just uploaded. Import only: verify and export are
+  # both off, so this job never SSHes anywhere, never starts a VM and never
+  # writes to a bucket.
+  #
+  # ENABLE_IMPORT is a one-time setup switch, not a per-run gate — it exists
+  # so this is inert in the window before the GCP side is configured. Setup:
+  # docs/ci-gcp-identity.md.
   import:
     needs: [select, build]
     if: ${{ vars.ENABLE_IMPORT == 'true' && !inputs.dry_run }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Whole-job budget, not per image: this imports every manifest serially,
+    # and `gcloud compute images create` blocks until GCP finishes. A minute
+    # or two each plus ~3 for checkout/pip/auth, so 30 covers a handful of
+    # blueprints with room. Raise it before raising the blueprint count — a
+    # kill mid-create leaves the image built but its dated name out of the
+    # log, and that name is what you would roll back to.
+    timeout-minutes: 30
     permissions:
       contents: read
+      # The runner asks GitHub for an OIDC token; this is what permits it.
       id-token: write
     steps:
       - uses: actions/checkout@v7
@@ -249,6 +261,9 @@ jobs:
       - name: Install Ansible
         run: pip install 'ansible-core>=2.16'
 
+      # This run's artifacts only, so the import touches exactly what this run
+      # built. merge-multiple flattens build-manifest-<slug>/<slug>.json down
+      # to .build/<slug>.json, which is where lab_build_dir points.
       - name: Fetch the build manifests
         uses: actions/download-artifact@v8
         with:
@@ -256,14 +271,62 @@ jobs:
           pattern: build-manifest-*
           merge-multiple: true
 
+      # Keyless. GitHub mints an OIDC token, Google's STS exchanges it for a
+      # federated token, and that impersonates GCP_SERVICE_ACCOUNT. No key
+      # file exists anywhere and the credential dies with the runner.
+      #
+      # Impersonation rather than direct Workload Identity Federation, and not
+      # by preference: Image Builder's share_with_accounts only accepts
+      # user:/serviceAccount:/group:/domain: principals, so the import has to
+      # run as something with a stable service account email. A federated
+      # principalSet does not have one.
       - uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          # Sets core/project. gcp_import passes --project on every call, but
+          # gcp_export's `gcloud storage objects describe` does not — so an
+          # ambient project is what stops a future export guessing.
+          project_id: ${{ vars.GCP_PROJECT_ID }}
 
+      # Load-bearing, not boilerplate: this is the step that runs
+      # `gcloud auth login --cred-file` against the file written above.
+      # Without it `gcloud auth list` is empty and gcp_target stops dead at
+      # "No active gcloud account".
       - uses: google-github-actions/setup-gcloud@v3
 
-      # verify=false to begin with: the verify phase SSHes to a throwaway VM,
-      # which from a GitHub runner needs port 22 reachable or IAP configured.
+      # One line answering "who was this?" ahead of all the Ansible output.
+      # Every interesting failure below is really a question about identity.
+      - name: Show which identity the import will run as
+        run: |
+          set -uo pipefail
+          # No `set -e`, and `|| true` on both: if gcloud itself errors, the
+          # whole point of this step is to still print what it managed to
+          # work out. Failing before the echo would hide exactly the
+          # diagnostic the step exists to produce. The explicit test at the
+          # end is what fails the job.
+          who=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null || true)
+          echo "Active account: ${who:-<none>}"
+          echo "Project       : $(gcloud config get-value project 2>/dev/null || true)"
+          if [ -z "$who" ]; then
+            echo "::error::No active gcloud account. The auth step produced no" \
+                 "usable credential, or setup-gcloud did not activate it." \
+                 "See docs/ci-gcp-identity.md."
+            exit 1
+          fi
+          # Only after the check — a summary saying "Importing as <none>" on
+          # a run that imported nothing is worse than no summary.
+          echo "Importing as \`${who}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # verify=false: that phase SSHes to a throwaway VM and nothing in the
+      # repo tunnels. Turning it on is a code change, not a flag — IAP would
+      # have to go through the gcloud ssh path *and* be added as a
+      # ProxyCommand to the inventory gcp_verify generates, which today has
+      # none.
+      #
+      # export=false: export defaults to *true* in group_vars, and leaving it
+      # on would start a Cloud Build job writing to gs://rhdp_images — which
+      # other teams consume, and which this service account is deliberately
+      # not permitted to do.
       - name: Import into GCP
-        run: ansible-playbook import-image.yml -e verify=false
+        run: ansible-playbook import-image.yml -e verify=false -e export=false

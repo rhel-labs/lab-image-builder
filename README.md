@@ -9,19 +9,23 @@ The work is split in two:
 | --- | --- | --- |
 | Playbooks | `pull-blueprints.yml`, `build-image.yml` | `import-image.yml` |
 | Input | `blueprints/<name>.yml` | `.build/*.json` |
-| Output | image in **Red Hat's** GCP project, shared to us | image + family in your project, disk file in a bucket |
-| Credentials | Red Hat service account | your own gcloud login |
+| Output | image in **Red Hat's** GCP project, shared to us | image + family in your project; from a laptop, also a disk file in a bucket |
+| Credentials | Red Hat service account | your gcloud login, or the CI service account |
 
 The split is not arbitrary. Image Builder's GCP target always writes into
 **Red Hat's own GCP project** and grants access to accounts you nominate —
 there is no setting that makes it write into yours. Copying the image across
 is a separate job with separate credentials, so it is a separate playbook.
 
-Part 2 does not just copy. For each image it boots a throwaway VM, runs your
-configuration playbooks against it, runs a list of checks, and deletes the VM
-— or leaves it running if anything failed. Images that pass are then exported
-to Cloud Storage as a portable disk file, for everything that cannot consume a
-GCE image.
+Part 2 does not just copy. Run from a laptop, it boots a throwaway VM for
+each image, runs your configuration playbooks against it, runs a list of
+checks, and deletes the VM — or leaves it running if anything failed. Images
+that pass are then exported to Cloud Storage as a portable disk file, for
+everything that cannot consume a GCE image.
+
+Run from CI it does the copy and stops: the verify phase needs SSH to the
+throwaway VM and the export writes to a shared bucket, so both are off there.
+See [Importing into GCP](#importing-into-gcp).
 
 ## Prerequisites
 
@@ -71,6 +75,10 @@ GCE image.
    It must be authenticated as a principal in `lab_share_with_accounts`
    (`group_vars/all/main.yml`), because that is who Image Builder shared the
    image with. `import-image.yml` warns up front if it is not.
+
+   That is the laptop path. Run from CI, Part 2 authenticates as a service
+   account via Workload Identity Federation instead — still no key file.
+   See [docs/ci-gcp-identity.md](docs/ci-gcp-identity.md).
 
 Part 1 needs no GCP credentials at all. Part 2 needs no Red Hat ones.
 
@@ -379,6 +387,11 @@ gh run download <run-id> -n build-manifest-lab-base-rhel-10.2 -D .build
 ansible-playbook import-image.yml
 ```
 
+You only need that if you are importing by hand. With `ENABLE_IMPORT` set,
+the `import` job already consumed this artifact in the same run and the image
+is in your project — reach for the download when you want the verify or
+export phases, which CI does not run.
+
 **The version number**, which is the genuinely non-obvious one. This repo
 remembers the console's version in `blueprints/.remote-state.json`, and
 [the drift guard](#the-drift-guard) compares the two: console ahead of the
@@ -414,7 +427,7 @@ from that:
 | --- | --- |
 | `select` | Works out which blueprints the commit changed. Usually one; change three and it builds all three, one after another. Deleting one does not try to build it. |
 | `build` | Everything in the walkthrough above. |
-| `import` | Part 2. **Currently does nothing** — see below. |
+| `import` | Part 2: copies the finished image into your GCP project under its family. Runs automatically once the `ENABLE_IMPORT` variable is `true`; skipped entirely until then, and also skipped on a `dry_run` dispatch — see [Importing into GCP](#importing-into-gcp). |
 
 ### Running it by hand
 
@@ -456,24 +469,56 @@ That is the whole setup. What happens to those two values on the runner, what
 keeps them out of the logs, and who can effectively use them once they are
 there: **[Credentials](#credentials)**.
 
-### Turning the import on
+### Importing into GCP
 
-The `import` job at the bottom of the workflow is Part 2, written but inert.
-It runs only when the `ENABLE_IMPORT` repository *variable* is set to `true`,
-and it needs three things first:
+The `import` job is Part 2. It runs **automatically** after a successful
+build, in the same run, over the manifests the build just uploaded — so a
+push to `build-image` ends with the image already in your project under its
+family, about twenty-five minutes later.
 
-1. **Workload Identity Federation** in the target project, bound to this repo,
-   plus a CI service account with compute admin and `storage.objectAdmin` on
-   the export bucket. Set `GCP_WORKLOAD_IDENTITY_PROVIDER` and
-   `GCP_SERVICE_ACCOUNT` as repository variables. No key file: the job
-   requests an OIDC token, which is why it carries `id-token: write`.
-2. **`lab_share_with_accounts` must name that service account**, and sharing
-   happens at *compose* time. Flipping the switch does not make images that
-   were already built importable by CI — they need rebuilding. This is the one
-   field coupling the two parts, and it is the easy thing to miss.
-3. **`verify=false` to begin with**, which is what the job passes. The verify
-   phase SSHes to the throwaway VM; from a GitHub runner that needs port 22
-   reachable or IAP configured, and that is a separate piece of work.
+It is **import only**. `verify` and `export` are both passed as `false`, so
+the job never SSHes anywhere, never starts a VM and never writes to a bucket:
+
+| Phase | In CI | Why |
+| --- | --- | --- |
+| `gcp_import` | ✅ | pure API calls |
+| `gcp_verify` | ❌ | SSHes to a throwaway VM, and nothing in the repo tunnels. The VM does get an external IP, so the real obstacle is the target VPC's ingress rule on port 22 — which lives outside this repo. Turning it on is a code change, not a flag: IAP would have to be threaded through the `gcloud compute ssh` path *and* added as a `ProxyCommand` to the inventory `gcp_verify` generates (there is none today) |
+| `gcp_export` | ❌ | writes to `gs://rhdp_images`, which other teams consume. Deliberately left to a human |
+
+Note `export` defaults to **true** in `group_vars`, so the job passes
+`-e export=false` explicitly. That is a correctness fix, not tidiness.
+
+**Setup is one-time and all on the GCP side** — a workload identity pool, a
+service account, a custom role, and four repository variables. The full
+walkthrough, including the failure modes that masquerade as something else, is
+**[docs/ci-gcp-identity.md](docs/ci-gcp-identity.md)**. Three things from it
+are worth knowing before you start:
+
+1. **CI authenticates with no key.** GitHub mints an OIDC token, Google
+   exchanges it, and that impersonates a service account. Nothing to store,
+   nothing to rotate. Impersonation rather than direct federation only
+   because `share_with_accounts` needs a real service account *email*.
+2. **Adding the service account to `lab_share_with_accounts` does not make
+   existing images importable.** Sharing happens at *compose* time, so the
+   first CI import has to consume an image composed after the change. There
+   is no way around it, and it is the most likely thing to confuse a first
+   run.
+3. **`GCP_PROJECT_ID` does not decide where images land.**
+   `lab_targets.<target>.project` does. The variable only sets gcloud's
+   ambient project. Let those two drift and the custom role is granted on one
+   project while images are created in another.
+
+**What you are accepting by having no approval gate.** `gcp_import` sets the
+image family, and a GCP family always resolves to its newest member. Every
+lab VM created from `--image-family lab-base-rhel-10-2` rolls forward the
+moment a CI build finishes — with no human in the loop, and with no verify
+phase having run. Rollback is by dated image name, which is in the job's
+output. If that trade stops being right, assign the job to a GitHub
+Environment with yourself as a required reviewer and the run will wait.
+
+**If a build leg fails, nothing imports** — including blueprints that
+succeeded, since `import` depends on the whole `build` job. Conservative on
+purpose.
 
 ## Targets
 
@@ -785,6 +830,7 @@ ansible.cfg
 inventory.yml                     localhost, connection: local
 group_vars/all/main.yml           endpoints, delivery target, targets, defaults
 docs/service-account.md           console-side RBAC setup
+docs/ci-gcp-identity.md           GCP identity CI imports as (keyless)
 .github/workflows/
   build-image.yml                 runs on pushes to the build-image branch
 blueprints/

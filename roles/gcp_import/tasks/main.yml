@@ -58,6 +58,32 @@
   changed_when: false
   failed_when: false
 
+# Checked before the generic failure below, because it tells the two apart.
+# gcp_target compares the active identity against lab_share_with_accounts as
+# it reads *now*; this compares it against what the image was actually
+# composed with, which the manifest recorded at the time. Those differ exactly
+# when someone has added a principal and not yet rebuilt — the single most
+# common first-CI-run failure, and the one whose generic symptom ("not found")
+# points nowhere near its cause.
+- name: Fail if this image was composed before the running identity was shared to
+  ansible.builtin.fail:
+    msg: |
+      {{ lab_manifest.rh_image_name }} was composed on
+      {{ lab_manifest.composed_at }} and shared only to:
+
+        {{ lab_manifest.shared_with | join('\n  ') }}
+
+      You are {{ lab_gcloud_principal | default('user:' ~ lab_gcloud_identity) }},
+      which is not in that list. Sharing happens at compose time, so editing
+      lab_share_with_accounts does not reach an image already built. Rebuild:
+
+        ansible-playbook build-image.yml -e blueprint={{ lab_manifest.blueprint_slug }}
+  when:
+    - lab_manifest.shared_with | default([]) | length > 0
+    - lab_gcloud_principal is defined
+    - lab_gcloud_principal | lower
+      not in (lab_manifest.shared_with | map('lower') | list)
+
 - name: Fail if the source image is gone
   ansible.builtin.fail:
     msg: |
