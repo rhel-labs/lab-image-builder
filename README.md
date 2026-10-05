@@ -3,6 +3,11 @@
 RHEL VM images for GCP labs, composed by Red Hat's hosted Image Builder at
 console.redhat.com from blueprints kept in this repo.
 
+> **Every code block below says whether it is yours to run.**
+> **Run** — type this. **Reference** — this is how something is shaped or
+> what something else does; you do not run it. **Output** — what you should
+> see back. The same labels are used in `docs/`.
+
 The work is split in two:
 
 | | Part 1 — build at Red Hat | Part 2 — import to GCP |
@@ -87,6 +92,8 @@ Part 1 needs no GCP credentials at all. Part 2 needs no Red Hat ones.
 There are **two** Red Hat credentials in play, and conflating them is what
 makes this confusing.
 
+**Reference — how they relate:**
+
 ```text
 RH_CLIENT_ID + RH_CLIENT_SECRET      long-lived. A password for a robot
          │                           account. Does not expire until you
@@ -110,7 +117,9 @@ see `lab_poll_*` in `group_vars/all/main.yml`. It is not a once-per-build step.
 
 ### Where the long-lived pair lives
 
-**On your laptop**, one file and nothing else:
+**On your laptop**, one file and nothing else.
+
+**Reference — where it lives:**
 
 ```text
 ~/.config/redhat/lab-images.env      mode 0600, outside this repo
@@ -172,6 +181,8 @@ account scoped by a User Access group, not a Red Hat login.
 
 ## Usage
 
+**Run — Part 1, build at Red Hat:**
+
 ```sh
 # Refresh local blueprints from the console (overwrites local files)
 ansible-playbook pull-blueprints.yml
@@ -187,6 +198,8 @@ ansible-playbook build-image.yml -e blueprint=lab-base-rhel-10.2 -e distribution
 ansible-playbook build-image.yml -e blueprint=... -e lab_architecture=aarch64
 ansible-playbook build-image.yml -e blueprint=... -e force_push=true
 ```
+
+**Run — Part 2, import into GCP:**
 
 ```sh
 # Import everything built, into the default target, and verify each image
@@ -219,6 +232,8 @@ deliberately asymmetric — see the drift guard below.
 ## Blueprint files
 
 A blueprint file is the portable part of the definition and nothing else:
+
+**Reference — what a blueprint file holds:**
 
 ```yaml
 customizations:
@@ -275,7 +290,9 @@ ways out: `pull-blueprints.yml -e blueprint=<slug>` to take theirs, or
 
 ### `force_push`
 
-Defaults to `false` in `group_vars/all/main.yml`. Set it per run:
+Defaults to `false` in `group_vars/all/main.yml`.
+
+**Run — set it for one build, when you mean it:**
 
 ```sh
 ansible-playbook build-image.yml -e blueprint=lab-base-rhel-10.2 -e force_push=true
@@ -328,6 +345,8 @@ wanted one right then.
 So the trigger is a branch you push to **on purpose**. `main` stays the
 branch of record; `build-image` is the one that means "build this now".
 
+**Run — this is the loop you will actually use:**
+
 ```sh
 git switch build-image
 git merge main                      # pick up whatever else has landed
@@ -341,8 +360,9 @@ git push                            # ← this is what starts a build
 `build-image` stale and wedge its own next build. That means `main` is now
 behind: build from a `main` checkout on your laptop and
 [the drift guard](#the-drift-guard) will fire, correctly, because the console
-has moved on and `main` does not know it. The fix is not `force_push` — it is
-to merge:
+has moved on and `main` does not know it. The fix is not `force_push`.
+
+**Run — merge the recorded version back:**
 
 ```sh
 git switch main
@@ -380,7 +400,10 @@ So before it dies, two things have to be rescued.
 **The manifest.** The build writes `.build/<slug>.json` — the handoff file
 Part 2 reads to know which image to import. `.build/` is gitignored, so it
 cannot be committed; instead each successful build attaches it to the run as
-an artifact named `build-manifest-<slug>`, kept 90 days:
+an artifact named `build-manifest-<slug>`, kept 90 days.
+
+**Run — only if you are importing by hand** (with `ENABLE_IMPORT` set, CI has
+already done this):
 
 ```sh
 gh run download <run-id> -n build-manifest-lab-base-rhel-10.2 -D .build
@@ -431,7 +454,9 @@ from that:
 
 ### Running it by hand
 
-You do not have to commit anything:
+You do not have to commit anything.
+
+**Run — start a build on demand:**
 
 ```sh
 # build now
@@ -488,7 +513,8 @@ the job never SSHes anywhere, never starts a VM and never writes to a bucket:
 Note `export` defaults to **true** in `group_vars`, so the job passes
 `-e export=false` explicitly. That is a correctness fix, not tidiness.
 
-**Setup is one-time, on the GCP side, and scripted:**
+**Run once — set up the GCP side.** Needs `gcloud` and `gh` authenticated,
+and owner on the project:
 
 ```sh
 ./scripts/setup-ci-gcp.sh            # show what is missing, change nothing
@@ -534,7 +560,9 @@ purpose.
 
 A target is "everywhere an image can land", named. Adding an environment is
 adding a key to `lab_targets` in `group_vars/all/main.yml`, not editing a
-playbook:
+playbook.
+
+**Reference — the shape of a target:**
 
 ```yaml
 target: lab            # the default; override with -e target=staging
@@ -557,6 +585,8 @@ This repo publishes images; it does not create lab VMs.
 
 `lab-base-rhel-10.2` composed at `2026-10-01T19:54:01Z` becomes:
 
+**Reference — what the import produces:**
+
 ```
 image  lab-base-rhel-10-2-20261001-1954
 family lab-base-rhel-10-2
@@ -565,7 +595,10 @@ family lab-base-rhel-10-2
 GCP resource names cannot contain dots and every RHEL point release has one,
 so the slug is sanitised. **The family is the handle labs should use** — it
 always resolves to the newest image in it, so a rebuild rolls every lab
-forward without anyone editing a lab definition:
+forward without anyone editing a lab definition.
+
+**Reference — how a lab consumes the family.** Not part of this repo, and not
+yours to run here; it is what Instruqt or a colleague does:
 
 ```sh
 gcloud compute instances create my-lab-vm \
@@ -595,7 +628,9 @@ of the project.
 
 ### Configuration playbooks
 
-Dropped in `provision/` and picked up by name:
+Dropped in `provision/` and picked up by name.
+
+**Reference — the lookup order:**
 
 ```sh
 provision/default.yml                # every image
@@ -646,6 +681,8 @@ image captured from the running VM, which this repo does not do.
 is **appended** to it, not substituted, so blueprint-specific checks are
 additions rather than a fork. Four keys:
 
+**Reference — what a test looks like:**
+
 ```yaml
 - name: cloud-init finished and found the GCE datasource
   command: cloud-init status --wait --long
@@ -672,6 +709,8 @@ Ansible, so a literal `{{` or `{%` needs `{% raw %}`.
 The VM is **kept** so you can log into the thing that actually broke, and
 the playbook prints the two commands you want:
 
+**Output — what a failure looks like:**
+
 ```
 4 failure(s) on lab-base-rhel-10-2-20261001-1954.
 verify-lab-base-rhel-10-2-20261001-1954-bs70 has been left running [...]
@@ -694,6 +733,8 @@ Every image that passes is written to Cloud Storage as a portable disk file —
 the handoff to anything that cannot consume a GCE image: RHDP, a libvirt host,
 another cloud.
 
+**Reference — where an export lands:**
+
 ```
 gs://rhdp_images/lab-base-rhel-10-2-20261001-1954.qcow2
 ```
@@ -701,6 +742,8 @@ gs://rhdp_images/lab-base-rhel-10-2-20261001-1954.qcow2
 The object name is `<prefix><image name>.<format>`, so it carries the same
 compose timestamp the image does and an export can always be traced back to
 the build it came from.
+
+**Reference — the export settings:**
 
 ```yaml
 export: true                  # -e export=false to skip
@@ -835,7 +878,9 @@ The image is already imported and unaffected by any of that — re-run with
 
 ## Layout
 
-```sh
+**Reference — what is where:**
+
+```text
 ansible.cfg
 inventory.yml                     localhost, connection: local
 group_vars/all/main.yml           endpoints, delivery target, targets, defaults

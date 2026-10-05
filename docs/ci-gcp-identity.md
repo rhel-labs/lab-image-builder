@@ -13,6 +13,8 @@ problem.
 
 ## Setting it up
 
+**Run once.** Needs `gcloud` and `gh` authenticated, and owner on the project:
+
 ```sh
 ./scripts/setup-ci-gcp.sh            # show what is missing, change nothing
 ./scripts/setup-ci-gcp.sh --apply    # create it
@@ -138,18 +140,24 @@ to go in a list in `group_vars/all/main.yml`.
 ## Why attribute binding and not subject
 
 This repository was created on 2026-10-01, after GitHub's 2026-07-15 cutoff
-for immutable OIDC subject claims. Confirm with:
+for immutable OIDC subject claims.
+
+**Run — confirm it on this repo:**
 
 ```sh
 gh api /repos/rhel-labs/lab-image-builder/actions/oidc/customization/sub
 ```
+
+**Output — what you should see:**
 
 ```json
 { "use_default": true, "use_immutable_subject": true,
   "sub_claim_prefix": "repo:rhel-labs@48067826/lab-image-builder@1400425076" }
 ```
 
-So the `sub` claim is
+So the `sub` claim is:
+
+**Reference — the subject this repo emits:**
 
 ```text
 repo:rhel-labs@48067826/lab-image-builder@1400425076:ref:refs/heads/build-image
@@ -187,6 +195,8 @@ changes nothing, so run that first — it answers most of these at once.
 
 The variables below are the ones the script defines; set them in your shell,
 or just read the values out of its dry-run output.
+
+**Run — in order, stopping at the first that misbehaves:**
 
 ```sh
 PROJECT_ID=tmm-instruqt-11-26-2021
@@ -234,7 +244,7 @@ In the import job's log, in order:
    Note it does **not** print `READY` — the source-status check is an `assert`
    with `quiet: true`, which is silent on success. Do not grep for it.
 
-Then confirm the result and that nothing else happened:
+**Run — confirm the result, and that nothing else happened:**
 
 ```sh
 gcloud compute images describe-from-family lab-base-rhel-10-2 \
@@ -263,7 +273,9 @@ VM means `-e verify=false` did not land; a Cloud Build job means
 | `compute.images.create` denied | The custom role is too tight; fall back to `roles/compute.storageAdmin` and narrow later |
 
 The STS and impersonation errors are deliberately vague client-side. The reason
-is server-side:
+is server-side.
+
+**Run — read the real reason out of Cloud Logging:**
 
 ```sh
 gcloud logging read \
@@ -282,7 +294,9 @@ the principalSet did not match, or the role is missing.
 organisation would not be an allowed member and the binding would be dropped —
 inside infrastructure we do not control, with no error surfaced to us.
 
-**Checked on 2026-10-02, and this is mostly a theoretical worry here:**
+**Checked on 2026-10-02, and this is mostly a theoretical worry here.**
+
+**Run — only if you need to re-check it:**
 
 ```sh
 gcloud projects get-ancestors red-hat-image-builder
@@ -312,7 +326,7 @@ an accepted prefix, and `gcp_target`'s warning already allows for it.
 There is nothing to rotate, which is the entire reason for this arrangement.
 No key exists. Credentials are minted per run and expire in under an hour.
 
-To revoke CI's access, delete the trust binding:
+**Run — to revoke CI's access, delete the trust binding:**
 
 ```sh
 gcloud iam service-accounts remove-iam-policy-binding "$SA_EMAIL" \

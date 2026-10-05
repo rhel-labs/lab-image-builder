@@ -77,6 +77,8 @@ needs to be added. Image Builder access arrives through the organisation's
 That is why the account can list, create, update and delete blueprints while
 holding, by its own account:
 
+**Reference — what the account reports about itself:**
+
 ```
 GET /api/rbac/v1/access/?application=image-builder   →  "count": 0
 ```
@@ -95,6 +97,8 @@ Blueprint CRUD does **not** check content-sources. An account with zero granted
 roles therefore looks completely healthy: `pull-blueprints.yml` succeeds, and
 `build-image.yml` succeeds all the way through validation, the drift guard and
 the blueprint push, before:
+
+**Output — the failure, when it finally comes:**
 
 ```
 403 unable to retrieve Red Hat repositories: user is not authorized -
@@ -124,8 +128,9 @@ Verified against this account.
 
 ## Verifying it
 
-Run this after any change to the group. It is far cheaper than discovering the
-answer 20 minutes into a compose.
+It is far cheaper than discovering the answer 20 minutes into a compose.
+
+**Run — after any change to the group:**
 
 ```sh
 set -a; . ~/.config/redhat/lab-images.env; set +a
@@ -142,7 +147,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   | python3 -m json.tool
 ```
 
-Correct output is `"count": 2`, listing:
+**Output — correct is `"count": 2`, listing:**
 
 ```
 content-sources:repositories:read
