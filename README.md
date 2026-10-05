@@ -3,10 +3,15 @@
 RHEL VM images for GCP labs, composed by Red Hat's hosted Image Builder at
 console.redhat.com from blueprints kept in this repo.
 
-> **Every code block below says whether it is yours to run.**
-> **Run** — type this. **Reference** — this is how something is shaped or
-> what something else does; you do not run it. **Output** — what you should
-> see back. The same labels are used in `docs/`.
+> **This README is in two halves.** [**Setup**](#setup) is everything you
+> have to run, in order, and nothing else. [**How it works**](#how-it-works)
+> is the reasoning, the day-to-day commands and the troubleshooting — read it
+> when you want to, not to get started. Everything in `docs/` is the second
+> kind.
+>
+> **Every code block says whether it is yours to run.** **Run** — type this.
+> **Reference** — how something is shaped, or what some other system does;
+> you do not run it. **Output** — what you should see back.
 
 The work is split in two:
 
@@ -32,58 +37,165 @@ Run from CI it does the copy and stops: the verify phase needs SSH to the
 throwaway VM and the export writes to a shared bucket, so both are off there.
 See [Importing into GCP](#importing-into-gcp).
 
-## Prerequisites
+## Setup
 
-1. **Ansible** — `brew install ansible`
-2. **A Red Hat service account** from
-   <https://console.redhat.com/iam/service-accounts>, added to a User Access
-   group holding **`Repositories viewer`** and **`Content Template viewer`**
-   (content-sources). Those two are the whole requirement — there is no Image
-   Builder role to add, because Image Builder access comes from the org's
-   Default access group.
+Everything you have to run, in order. Each step says what it is for in one
+line; the reasoning lives under [How it works](#how-it-works) and in `docs/`.
+Stop after whichever step gets you what you need — 1–3 is a working laptop
+build, 4 adds CI, 5 adds the GCP import.
 
-   Privileges attach to the *group*, and the account goes on the group's
-   **Service accounts** tab, which is not the Members tab. Full write-up,
-   including why an account with no roles appears to work right up until the
-   compose: **[docs/service-account.md](docs/service-account.md)**.
+### 1. Install the tools
 
-   Confirm before building:
+**Run:**
 
-   ```sh
-   curl -H "Authorization: Bearer $TOKEN" \
-     'https://console.redhat.com/api/rbac/v1/access/?application=content-sources'
-   ```
+```sh
+brew install ansible
+brew install --cask google-cloud-sdk   # Part 2 only
+gcloud auth login                      # Part 2 only
+```
 
-   `"count": 2` is correct. `"count": 0` means no roles, or an account that
-   was never added to the group. `build-image.yml` detects the resulting 403
-   and prints the fix rather than an HTTP dump.
-3. **Credentials on disk**, outside this repo so they cannot be committed:
+Nothing else. Every role is pure `ansible.builtin` — no collections.
 
-   ```sh
-   mkdir -p ~/.config/redhat
-   touch ~/.config/redhat/lab-images.env
-   chmod 600 ~/.config/redhat/lab-images.env
-   $EDITOR ~/.config/redhat/lab-images.env
-   ```
+### 2. Get a Red Hat service account
 
-   ```sh
-   RH_CLIENT_ID=...
-   RH_CLIENT_SECRET=...
-   ```
+Create one at <https://console.redhat.com/iam/service-accounts> and add it to
+a User Access group holding **`Repositories viewer`** and **`Content Template
+viewer`**. Those two are the whole requirement; there is no Image Builder role
+to add. Privileges attach to the *group*, and the account goes on the group's
+**Service accounts** tab, not the Members tab.
 
-   Type them into the editor — not into a shell command, which lands in your
-   history.
-4. **gcloud, for Part 2 only** — `brew install --cask google-cloud-sdk`, then
-   `gcloud auth login`. Part 2 drives the CLI directly: no Ansible
-   collection, no service account key, no ADC JSON.
+Full walkthrough, including why an account with no roles looks healthy right
+up until the compose: **[docs/service-account.md](docs/service-account.md)**.
 
-   It must be authenticated as a principal in `lab_share_with_accounts`
-   (`group_vars/all/main.yml`), because that is who Image Builder shared the
-   image with. `import-image.yml` warns up front if it is not.
+**Run — put the credentials on disk, outside this repo so they cannot be
+committed:**
 
-   That is the laptop path. Run from CI, Part 2 authenticates as a service
-   account via Workload Identity Federation instead — still no key file.
-   See [docs/ci-gcp-identity.md](docs/ci-gcp-identity.md).
+```sh
+mkdir -p ~/.config/redhat
+touch ~/.config/redhat/lab-images.env
+chmod 600 ~/.config/redhat/lab-images.env
+$EDITOR ~/.config/redhat/lab-images.env
+```
+
+**Reference — what goes in that file:**
+
+```sh
+RH_CLIENT_ID=...
+RH_CLIENT_SECRET=...
+```
+
+Type them into the editor, not into a shell command, which lands in your
+history.
+
+**Run — confirm the permissions before building:**
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" \
+  'https://console.redhat.com/api/rbac/v1/access/?application=content-sources'
+```
+
+`"count": 2` is correct. `"count": 0` means no roles, or an account that was
+never added to the group.
+
+### 3. Build an image from your laptop
+
+**Run:**
+
+```sh
+ansible-playbook build-image.yml -e blueprint=lab-base-rhel-10.2
+```
+
+About twenty minutes. The image lands in **Red Hat's** GCP project, shared to
+whoever `lab_share_with_accounts` names, and a manifest is written to
+`.build/`. [More ways to run it](#usage).
+
+**Run — copy it into your own GCP project:**
+
+```sh
+ansible-playbook import-image.yml
+```
+
+That is the whole laptop workflow. Steps 4 and 5 only add automation.
+
+### 4. Build from CI instead
+
+So that committing a blueprint composes it without anyone remembering to.
+Requires two repository secrets and nothing else — the runner installs
+`ansible-core` and no collections.
+
+**Run:**
+
+```sh
+gh secret set RH_CLIENT_ID     --repo rhel-labs/lab-image-builder
+gh secret set RH_CLIENT_SECRET --repo rhel-labs/lab-image-builder
+```
+
+Then push a blueprint change to the `build-image` branch, or dispatch one by
+hand. [Why a branch and not main](#why-a-branch-and-not-main).
+
+**Run — check it works without composing anything (~30s):**
+
+```sh
+gh workflow run build-image.yml --ref build-image \
+  -f blueprint=lab-base-rhel-10.2 -f dry_run=true
+gh run watch
+```
+
+### 5. Let CI import into GCP too
+
+So that a push ends with the image already in your project, with no further
+input. This is the only step with real GCP setup, and it is scripted.
+
+**Run — 5a. Create the GCP side.** Workload identity pool, provider, service
+account, a five-permission custom role, IAM bindings, and three of the four
+repository variables. Run it with no arguments first to see what it would do:
+
+```sh
+./scripts/setup-ci-gcp.sh --apply
+```
+
+**Run — 5b. Switch the import on.**
+
+```sh
+gh variable set ENABLE_IMPORT --repo rhel-labs/lab-image-builder --body true
+```
+
+**Run — 5c. Put the code on the branch CI builds from.** This is also what
+carries the service account into `lab_share_with_accounts`:
+
+```sh
+git push origin main:build-image
+```
+
+**Run — 5d. Build something, which now imports too.**
+
+```sh
+gh workflow run build-image.yml --ref build-image \
+  -f blueprint=lab-base-rhel-10.2
+gh run watch
+```
+
+**Run — confirm it landed:**
+
+```sh
+gcloud compute images describe-from-family lab-base-rhel-10-2 \
+  --project tmm-instruqt-11-26-2021 --format='value(name,status)'
+```
+
+**5c and 5d cannot be reordered or skipped.** Sharing happens at *compose*
+time, so the first import has to consume an image composed after the service
+account was named. Anything built before that stays unreachable from CI no
+matter what the config says afterwards.
+
+If a step fails, **[docs/ci-gcp-identity.md](docs/ci-gcp-identity.md)** has a
+symptom-to-cause table.
+
+---
+
+# How it works
+
+Nothing below is a step. It is the reasoning behind the setup above, the
+day-to-day commands, and what to read when something breaks.
 
 Part 1 needs no GCP credentials at all. Part 2 needs no Red Hat ones.
 
@@ -481,72 +593,26 @@ you want to know whether it is the credentials or the build. What it does
 *not* prove: pull needs no content-sources permissions, so it can pass while
 `POST /compose` is still unauthorised.
 
-### Setup
+### What CI needs from you
 
-Two repository secrets, under *Settings → Secrets and variables → Actions*:
+Two repository secrets, and that is all —
+[Setup step 4](#4-build-from-ci-instead) sets them.
 
 | Name | Value |
 | --- | --- |
 | `RH_CLIENT_ID` | the service account's client id |
 | `RH_CLIENT_SECRET` | its secret |
 
-That is the whole setup. What happens to those two values on the runner, what
-keeps them out of the logs, and who can effectively use them once they are
-there: **[Credentials](#credentials)**.
+What happens to those two values on the runner, what keeps them out of the
+logs, and who can effectively use them once they are there:
+**[Credentials](#credentials)**.
 
 ### Importing into GCP
 
-#### Turning it on: four commands
+#### Turning it on
 
-Nothing below needs reading first. Run these in order, from a clone of this
-repo, with `gcloud` and `gh` logged in.
-
-**Run — 1. Create the GCP side.** Pool, provider, service account, custom
-role, IAM bindings, and three of the four repository variables. Run it with
-no arguments first to see what it would do:
-
-```sh
-./scripts/setup-ci-gcp.sh --apply
-```
-
-**Run — 2. Switch the import on.**
-
-```sh
-gh variable set ENABLE_IMPORT --repo rhel-labs/lab-image-builder --body true
-```
-
-**Run — 3. Put the code on the branch CI builds from.** `build-image` is
-behind `main`; this is also what carries the service account into
-`lab_share_with_accounts`, which is already committed:
-
-```sh
-git push origin main:build-image
-```
-
-**Run — 4. Build something, which now imports too.**
-
-```sh
-gh workflow run build-image.yml --ref build-image \
-  -f blueprint=lab-base-rhel-10.2
-gh run watch
-```
-
-About twenty-five minutes later the image is in `tmm-instruqt-11-26-2021`
-under the family `lab-base-rhel-10-2`. Every later push of a blueprint to
-`build-image` does the same with no further input.
-
-**Run — check it landed:**
-
-```sh
-gcloud compute images describe-from-family lab-base-rhel-10-2 \
-  --project tmm-instruqt-11-26-2021 --format='value(name,status)'
-```
-
-Step 4 cannot be skipped and step 3 cannot be reordered after it: sharing
-happens at *compose* time, so the first import has to consume an image
-composed after the service account was named. Images built before that stay
-unreachable from CI no matter what. If something goes wrong,
-[docs/ci-gcp-identity.md](docs/ci-gcp-identity.md) has a symptom table.
+Five commands, in [Setup step 5](#5-let-ci-import-into-gcp-too). They are not
+repeated here so there is only ever one copy to follow.
 
 #### How it works
 
@@ -567,12 +633,12 @@ the job never SSHes anywhere, never starts a VM and never writes to a bucket:
 Note `export` defaults to **true** in `group_vars`, so the job passes
 `-e export=false` explicitly. That is a correctness fix, not tidiness.
 
-Setup is the four commands above. `scripts/setup-ci-gcp.sh` is re-runnable
-and checks before it creates, so running it again is how you confirm the GCP
-side rather than something to avoid. Why each piece exists, and what to do
-when it misbehaves: **[docs/ci-gcp-identity.md](docs/ci-gcp-identity.md)**.
+`scripts/setup-ci-gcp.sh` is re-runnable and checks before it creates, so
+running it again with no arguments is how you confirm the GCP side rather
+than something to avoid. Why each piece exists, and what to do when it
+misbehaves: **[docs/ci-gcp-identity.md](docs/ci-gcp-identity.md)**.
 
-Three things are worth knowing, though none of them change what you type:
+Three things are worth knowing, though none change what you type:
 
 1. **CI authenticates with no key.** GitHub mints an OIDC token, Google
    exchanges it, and that impersonates a service account. Nothing to store,

@@ -11,35 +11,38 @@ message. Both of the characteristic failures — a federation mismatch and an
 unshared source image — surface as something that sounds like a different
 problem.
 
+> **This document is reference, not a checklist.** The steps to configure CI
+> import are [Setup step 5](../README.md#5-let-ci-import-into-gcp-too) in the
+> README — five commands. Read this when you want to know why they are what
+> they are, or when one of them fails.
+
 ## Setting it up
 
-**Run once.** Needs `gcloud` and `gh` authenticated, and owner on the project:
+One command, from [Setup step 5](../README.md#5-let-ci-import-into-gcp-too):
+
+**Run:**
 
 ```sh
-./scripts/setup-ci-gcp.sh            # show what is missing, change nothing
-./scripts/setup-ci-gcp.sh --apply    # create it
+./scripts/setup-ci-gcp.sh --apply    # or no arguments to see what it would do
 ```
 
-That is the whole GCP side. The script creates the pool, the provider, the
-service account, the custom role, both IAM bindings and the three repository
-variables, and it is safe to re-run — every step checks before it creates, so
-a partial failure is fixed by running it again.
+It creates the pool, the provider, the service account, the custom role, both
+IAM bindings and three repository variables, and is safe to re-run — every
+step checks before it creates, so a partial failure is fixed by running it
+again.
 
-It needs `gcloud` and `gh`, both authenticated, and `roles/owner` or
-equivalent on the project. Override any of `PROJECT_ID`, `REPO`, `BRANCH`,
-`POOL`, `PROVIDER`, `SA_ID`, `ROLE_ID` from the environment.
+It needs `gcloud` and `gh` authenticated, and `roles/owner` or equivalent on
+the project. Override any of `PROJECT_ID`, `REPO`, `BRANCH`, `POOL`,
+`PROVIDER`, `SA_ID`, `ROLE_ID` from the environment.
 
-It deliberately stops short of two things and prints them at the end, because
-both are judgement calls rather than plumbing:
+It deliberately stops short of two things, because both are judgement calls
+rather than plumbing, and both are steps 5b–5d in the README:
 
 1. **Adding the service account to `lab_share_with_accounts` and rebuilding.**
    Sharing happens at *compose* time, so images already built stay unreachable
    from CI however the list reads now.
-2. **Setting `ENABLE_IMPORT=true`.** That is the switch that makes CI start
+2. **Setting `ENABLE_IMPORT`.** That is the switch that makes CI start
    importing, and it should be yours to throw.
-
-The rest of this document is why it does what it does, and what to do when it
-does not work. You do not need it to run the script.
 
 ### What it creates
 

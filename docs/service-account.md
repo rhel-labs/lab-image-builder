@@ -1,5 +1,10 @@
 # The Red Hat service account
 
+> **This document is reference, not a checklist.** The steps to create and
+> configure the account are [Setup step 2](../README.md#2-get-a-red-hat-service-account)
+> in the README. Read this for why the permissions are what they are, or when
+> something 403s.
+
 Everything in this repo authenticates as one Red Hat Hybrid Cloud Console
 service account. This is the configuration that is known to work, written down
 because it is not discoverable from the console UI and the failure mode is
