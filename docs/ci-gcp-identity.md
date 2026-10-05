@@ -11,111 +11,69 @@ message. Both of the characteristic failures — a federation mismatch and an
 unshared source image — surface as something that sounds like a different
 problem.
 
-## Settings in use
+## Setting it up
 
-| | |
+```sh
+./scripts/setup-ci-gcp.sh            # show what is missing, change nothing
+./scripts/setup-ci-gcp.sh --apply    # create it
+```
+
+That is the whole GCP side. The script creates the pool, the provider, the
+service account, the custom role, both IAM bindings and the three repository
+variables, and it is safe to re-run — every step checks before it creates, so
+a partial failure is fixed by running it again.
+
+It needs `gcloud` and `gh`, both authenticated, and `roles/owner` or
+equivalent on the project. Override any of `PROJECT_ID`, `REPO`, `BRANCH`,
+`POOL`, `PROVIDER`, `SA_ID`, `ROLE_ID` from the environment.
+
+It deliberately stops short of two things and prints them at the end, because
+both are judgement calls rather than plumbing:
+
+1. **Adding the service account to `lab_share_with_accounts` and rebuilding.**
+   Sharing happens at *compose* time, so images already built stay unreachable
+   from CI however the list reads now.
+2. **Setting `ENABLE_IMPORT=true`.** That is the switch that makes CI start
+   importing, and it should be yours to throw.
+
+The rest of this document is why it does what it does, and what to do when it
+does not work. You do not need it to run the script.
+
+### What it creates
+
+| Thing | Value |
 |---|---|
-| Project | `tmm-instruqt-11-26-2021` |
-| Workload identity pool | `github` |
-| Pool provider | `lab-image-builder` |
-| Issuer | `https://token.actions.githubusercontent.com` |
+| Pool | `github` |
+| Provider | `lab-image-builder`, issuer `token.actions.githubusercontent.com` |
 | Attribute condition | repository + repository id + `refs/heads/build-image` |
-| IAM binding keyed on | `attribute.repository` — **not** `google.subject` |
 | Service account | `lab-image-importer@tmm-instruqt-11-26-2021.iam.gserviceaccount.com` |
-| Role on the project | custom `labImageImporter`, 5 permissions |
-| Access to the source image | from the Image Builder share, not from IAM |
+| Custom role | `labImageImporter` — 5 permissions, listed below |
+| Trust binding | `roles/iam.workloadIdentityUser` on `attribute.repository`, **not** `google.subject` |
+| Debug binding | `roles/iam.serviceAccountTokenCreator` for you, so you can reproduce CI locally |
+| Repo variables | `GCP_PROJECT_ID`, `GCP_SERVICE_ACCOUNT`, `GCP_WORKLOAD_IDENTITY_PROVIDER` |
 | Keys | none, by design |
 
-`GCP_PROJECT_ID` **does not choose where images land.** That is
-`lab_targets.<target>.project` in `group_vars/all/main.yml`. The variable only
-sets gcloud's ambient `core/project`. The two must agree — if they drift, the
-custom role is granted on one project while images are created in another, and
-the failure is a bare permission denial that points at neither.
+Variables rather than secrets: none of it is sensitive, and being able to read
+the values in a failed run's log is what makes a federation problem
+debuggable. `ENABLE_IMPORT` is the fourth variable and the script leaves it to
+you.
 
-Plus four repository variables (not secrets — none of this is sensitive, and
-seeing the values in a log is what makes a federation failure debuggable):
+**`GCP_PROJECT_ID` does not choose where images land.** That is
+`lab_targets.<target>.project` in `group_vars/all/main.yml`; the variable only
+sets gcloud's ambient `core/project`. They must agree — let them drift and the
+custom role is granted on one project while images are created in another,
+and the failure is a bare permission denial pointing at neither.
 
-| Variable | Value |
-|---|---|
-| `ENABLE_IMPORT` | `true` |
-| `GCP_PROJECT_ID` | `tmm-instruqt-11-26-2021` — see the warning below |
-| `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/866520833223/locations/global/workloadIdentityPools/github/providers/lab-image-builder` |
-| `GCP_SERVICE_ACCOUNT` | `lab-image-importer@tmm-instruqt-11-26-2021.iam.gserviceaccount.com` |
+Two details worth knowing even though the script handles them, because they
+are what you will check first when something 403s:
 
-## Creating it
-
-```sh
-set -euo pipefail
-
-PROJECT_ID=tmm-instruqt-11-26-2021
-PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
-REPO=rhel-labs/lab-image-builder
-REPO_ID=$(gh api "/repos/${REPO}" --jq .id)
-BRANCH=refs/heads/build-image
-
-POOL=github
-PROVIDER=lab-image-builder
-SA_ID=lab-image-importer
-SA_EMAIL="${SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
-POOL_RESOURCE="projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL}"
-```
-
-Note **`PROJECT_NUMBER`, not `PROJECT_ID`**, in the pool resource name and in
-every `principalSet://`. Using the id there is invalid and the error does not
-say so.
-
-```sh
-gcloud services enable \
-  iam.googleapis.com sts.googleapis.com iamcredentials.googleapis.com \
-  cloudresourcemanager.googleapis.com compute.googleapis.com \
-  --project="$PROJECT_ID"
-```
-
-As of 2026-10-02, `iam`, `iamcredentials` and `compute` were already enabled
-on this project; **`sts` and `cloudresourcemanager` were not.** `sts` is the
-token exchange itself, so federation cannot work until it is on — and its
-absence is the first thing to re-check if the auth step 403s.
-
-`iamcredentials.googleapis.com` is the one people usually forget (it is the
-impersonation half, and without it the exchange succeeds and
-`generateAccessToken` 403s in a way that reads like a missing IAM binding).
-Here it happens to be on already.
-
-```sh
-gcloud iam workload-identity-pools create "$POOL" \
-  --project="$PROJECT_ID" --location=global \
-  --display-name='GitHub Actions' \
-  --description='Federated identities for GitHub-hosted runners. No keys.'
-
-gcloud iam workload-identity-pools providers create-oidc "$PROVIDER" \
-  --project="$PROJECT_ID" --location=global \
-  --workload-identity-pool="$POOL" \
-  --display-name='rhel-labs/lab-image-builder' \
-  --issuer-uri='https://token.actions.githubusercontent.com' \
-  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.repository_id=assertion.repository_id,attribute.repository_owner=assertion.repository_owner,attribute.ref=assertion.ref" \
-  --attribute-condition="assertion.repository == '${REPO}' && assertion.repository_id == '${REPO_ID}' && assertion.ref == '${BRANCH}'"
-
-gcloud iam service-accounts create "$SA_ID" \
-  --project="$PROJECT_ID" \
-  --display-name='lab-image-builder CI importer' \
-  --description='Copies images composed by Red Hat Image Builder into this project. Assumed from GitHub Actions via Workload Identity Federation. No keys should ever exist for it.'
-```
-
-Do not pass `--allowed-audiences`. The default audience is the full provider
-resource URL, which is exactly what the auth action requests.
-
-### The trust binding
-
-```sh
-gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
-  --project="$PROJECT_ID" \
-  --role=roles/iam.workloadIdentityUser \
-  --member="principalSet://iam.googleapis.com/${POOL_RESOURCE}/attribute.repository/${REPO}" \
-  --condition=None
-```
-
-**Do not use the `.../subject/repo:ORG/REPO:ref:...` form every tutorial
-shows.** See "Why attribute binding" below — it fails silently here.
+- The pool path uses the project **number**, not the id. Using the id is
+  invalid and the error does not say so.
+- `sts.googleapis.com` is the token exchange itself. It was **disabled** on
+  this project as of 2026-10-02, along with `cloudresourcemanager`; the script
+  enables both. `iamcredentials` — usually the forgotten one, since without it
+  the exchange succeeds and `generateAccessToken` 403s like a missing binding
+  — happened to be on already.
 
 ## Granting privileges
 
@@ -136,19 +94,7 @@ labels passed with it, and polling the global operation it returns. Omitting
 server-side and the CLI then fails while waiting, which Ansible reports as a
 failed import that actually succeeded.
 
-```sh
-gcloud iam roles create labImageImporter \
-  --project="$PROJECT_ID" \
-  --title='Lab image importer' \
-  --description='Create GCE images from images shared in by Red Hat Image Builder. No delete, no disks, no snapshots, no instances.' \
-  --stage=GA \
-  --permissions=compute.images.create,compute.images.get,compute.images.list,compute.images.setLabels,compute.globalOperations.get
-
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="projects/${PROJECT_ID}/roles/labImageImporter" \
-  --condition=None
-```
+Those five are the `PERMISSIONS` array in `scripts/setup-ci-gcp.sh`.
 
 `roles/compute.storageAdmin` also works and is the smallest *predefined* role
 containing `compute.images.create` — there is no predefined "image creator".
@@ -236,15 +182,21 @@ access from another branch.
 ## Verifying it
 
 In order. Each step isolates one thing, and the expensive one is last.
+`./scripts/setup-ci-gcp.sh` with no arguments re-checks every resource and
+changes nothing, so run that first — it answers most of these at once.
+
+The variables below are the ones the script defines; set them in your shell,
+or just read the values out of its dry-run output.
 
 ```sh
-# 0. IAM alone, no federation involved. Needs
-#    roles/iam.serviceAccountTokenCreator on the SA for yourself — worth
-#    keeping, it is how you debug everything below without pushing a commit.
-gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
-  --project="$PROJECT_ID" --role=roles/iam.serviceAccountTokenCreator \
-  --member='user:myee@redhat.com' --condition=None
+PROJECT_ID=tmm-instruqt-11-26-2021
+SA_EMAIL=lab-image-importer@${PROJECT_ID}.iam.gserviceaccount.com
+POOL=github
+PROVIDER=lab-image-builder
 
+# 0. IAM alone, no federation involved. The script already granted you
+#    serviceAccountTokenCreator on the SA, which is what makes this work —
+#    it is how you debug everything below without pushing a commit.
 gcloud compute images list --project="$PROJECT_ID" --no-standard-images \
   --limit 1 --impersonate-service-account="$SA_EMAIL"
 # Good: a name, or empty with rc 0. A 403 means the role binding.

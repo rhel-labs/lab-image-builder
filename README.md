@@ -488,11 +488,21 @@ the job never SSHes anywhere, never starts a VM and never writes to a bucket:
 Note `export` defaults to **true** in `group_vars`, so the job passes
 `-e export=false` explicitly. That is a correctness fix, not tidiness.
 
-**Setup is one-time and all on the GCP side** — a workload identity pool, a
-service account, a custom role, and four repository variables. The full
-walkthrough, including the failure modes that masquerade as something else, is
-**[docs/ci-gcp-identity.md](docs/ci-gcp-identity.md)**. Three things from it
-are worth knowing before you start:
+**Setup is one-time, on the GCP side, and scripted:**
+
+```sh
+./scripts/setup-ci-gcp.sh            # show what is missing, change nothing
+./scripts/setup-ci-gcp.sh --apply    # create it
+```
+
+That creates the workload identity pool, the provider, a service account, a
+five-permission custom role, both IAM bindings and three repository
+variables. Re-runnable — it checks before it creates. Why each piece exists
+and what to do when it misbehaves:
+**[docs/ci-gcp-identity.md](docs/ci-gcp-identity.md)**.
+
+The script stops short of the two steps that are judgement calls, and three
+things are worth knowing before you start:
 
 1. **CI authenticates with no key.** GitHub mints an OIDC token, Google
    exchanges it, and that impersonates a service account. Nothing to store,
@@ -833,6 +843,8 @@ docs/service-account.md           console-side RBAC setup
 docs/ci-gcp-identity.md           GCP identity CI imports as (keyless)
 .github/workflows/
   build-image.yml                 runs on pushes to the build-image branch
+scripts/
+  setup-ci-gcp.sh                 one-time keyless GCP setup for CI import
 blueprints/
   lab-base-rhel-10.2.yml          edit these
   .remote-state.json              slug -> id + version (committed)
