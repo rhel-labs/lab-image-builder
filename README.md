@@ -496,6 +496,60 @@ there: **[Credentials](#credentials)**.
 
 ### Importing into GCP
 
+#### Turning it on: four commands
+
+Nothing below needs reading first. Run these in order, from a clone of this
+repo, with `gcloud` and `gh` logged in.
+
+**Run — 1. Create the GCP side.** Pool, provider, service account, custom
+role, IAM bindings, and three of the four repository variables. Run it with
+no arguments first to see what it would do:
+
+```sh
+./scripts/setup-ci-gcp.sh --apply
+```
+
+**Run — 2. Switch the import on.**
+
+```sh
+gh variable set ENABLE_IMPORT --repo rhel-labs/lab-image-builder --body true
+```
+
+**Run — 3. Put the code on the branch CI builds from.** `build-image` is
+behind `main`; this is also what carries the service account into
+`lab_share_with_accounts`, which is already committed:
+
+```sh
+git push origin main:build-image
+```
+
+**Run — 4. Build something, which now imports too.**
+
+```sh
+gh workflow run build-image.yml --ref build-image \
+  -f blueprint=lab-base-rhel-10.2
+gh run watch
+```
+
+About twenty-five minutes later the image is in `tmm-instruqt-11-26-2021`
+under the family `lab-base-rhel-10-2`. Every later push of a blueprint to
+`build-image` does the same with no further input.
+
+**Run — check it landed:**
+
+```sh
+gcloud compute images describe-from-family lab-base-rhel-10-2 \
+  --project tmm-instruqt-11-26-2021 --format='value(name,status)'
+```
+
+Step 4 cannot be skipped and step 3 cannot be reordered after it: sharing
+happens at *compose* time, so the first import has to consume an image
+composed after the service account was named. Images built before that stay
+unreachable from CI no matter what. If something goes wrong,
+[docs/ci-gcp-identity.md](docs/ci-gcp-identity.md) has a symptom table.
+
+#### How it works
+
 The `import` job is Part 2. It runs **automatically** after a successful
 build, in the same run, over the manifests the build just uploaded — so a
 push to `build-image` ends with the image already in your project under its
@@ -513,22 +567,12 @@ the job never SSHes anywhere, never starts a VM and never writes to a bucket:
 Note `export` defaults to **true** in `group_vars`, so the job passes
 `-e export=false` explicitly. That is a correctness fix, not tidiness.
 
-**Run once — set up the GCP side.** Needs `gcloud` and `gh` authenticated,
-and owner on the project:
+Setup is the four commands above. `scripts/setup-ci-gcp.sh` is re-runnable
+and checks before it creates, so running it again is how you confirm the GCP
+side rather than something to avoid. Why each piece exists, and what to do
+when it misbehaves: **[docs/ci-gcp-identity.md](docs/ci-gcp-identity.md)**.
 
-```sh
-./scripts/setup-ci-gcp.sh            # show what is missing, change nothing
-./scripts/setup-ci-gcp.sh --apply    # create it
-```
-
-That creates the workload identity pool, the provider, a service account, a
-five-permission custom role, both IAM bindings and three repository
-variables. Re-runnable — it checks before it creates. Why each piece exists
-and what to do when it misbehaves:
-**[docs/ci-gcp-identity.md](docs/ci-gcp-identity.md)**.
-
-The script stops short of the two steps that are judgement calls, and three
-things are worth knowing before you start:
+Three things are worth knowing, though none of them change what you type:
 
 1. **CI authenticates with no key.** GitHub mints an OIDC token, Google
    exchanges it, and that impersonates a service account. Nothing to store,
